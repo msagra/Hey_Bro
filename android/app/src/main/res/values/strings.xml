@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Hey Bro Device Operator Service allows voice commands to perform actions on your behalf.</string>
+</resources>
