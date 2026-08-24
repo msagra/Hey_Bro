@@ -13,7 +13,8 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv()
+env_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=env_path)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -41,7 +42,7 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "").strip()
 # Model overrides (all optional – sensible defaults are used when unset)
 DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
 DEEPSEEK_MODEL    = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat").strip()
-GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL      = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 groq_async_client  = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 groq_sync_client   = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
@@ -598,7 +599,7 @@ async def _groq_llm_decision(transcript: str, history: list, tts_manager=None) -
     content = ""
     try:
         response_stream = await groq_async_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="groq/compound",
             messages=messages,
             temperature=0.0,
             max_tokens=350,
@@ -756,12 +757,17 @@ async def chat_endpoint(payload: dict):
     messages.append({"role": "user", "content": message})
 
     if provider == "groq" and groq_async_client:
-        selected_model = model or "llama-3.3-70b-versatile"
-        response = await groq_async_client.chat.completions.create(
-            model=selected_model, messages=messages, temperature=0.4, max_tokens=800
-        )
-        reply = response.choices[0].message.content or "I could not generate a response."
-        return {"reply": reply.strip(), "provider": "groq", "model": selected_model}
+        selected_model = model or "groq/compound"
+        if selected_model == "llama-3.3-70b-versatile":
+            selected_model = "groq/compound"
+        try:
+            response = await groq_async_client.chat.completions.create(
+                model=selected_model, messages=messages, temperature=0.4, max_tokens=800
+            )
+            reply = response.choices[0].message.content or "I could not generate a response."
+            return {"reply": reply.strip(), "provider": "groq", "model": selected_model}
+        except Exception as e:
+            return {"error": f"Groq Error: {str(e)}"}
 
     if provider == "deepseek" and DEEPSEEK_API_KEY:
         selected_model = model or DEEPSEEK_MODEL

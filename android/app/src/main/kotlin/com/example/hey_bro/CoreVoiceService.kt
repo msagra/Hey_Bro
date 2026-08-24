@@ -13,7 +13,6 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -35,15 +34,6 @@ enum class ServiceState { IDLE, LISTENING, PROCESSING, SPEAKING }
 
 /**
  * CoreVoiceService – fully local, zero-network AI voice assistant service.
- *
- * Pipeline:
- *  1. Wake word detection  → WakeWordManager (failover chain)
- *  2. Speech-to-text       → LocalSttEngine (Android built-in, offline-capable)
- *  3. Command parsing      → LocalCommandProcessor (rule engine)
- *  4. Action execution     → DeviceOperatorService (accessibility)
- *  5. Text-to-speech       → LocalTtsEngine (Android built-in, offline)
- *
- * No internet, no API keys, no server required.
  */
 class CoreVoiceService : Service(),
     LocalSttEngine.Listener,
@@ -52,12 +42,22 @@ class CoreVoiceService : Service(),
     // ── Companion ─────────────────────────────────────────────────────────────
     companion object {
         private const val TAG             = "CoreVoiceService"
-        private const val CHANNEL_ID      = "HeyBroChannel"
+        private const val CHANNEL_ID      = "HeyBroChannelSilentV3"
+        private const val LEGACY_CHANNEL_ID_V2 = "HeyBroChannelSilentV2"
+        private const val LEGACY_CHANNEL_ID_V1 = "HeyBroChannel"
         private const val NOTIFICATION_ID = 1
         private const val SAMPLE_RATE     = 16000
+        private const val KEY_BACKEND_WS  = "backend_ws"
+        private const val DEFAULT_BACKEND_WS = "wss://hey-bro-1zxk.onrender.com/ws/audio"
 
         var activeEngineName: String = "None"
         var eventSink: EventChannel.EventSink? = null
+
+        @Volatile private var activeInstance: CoreVoiceService? = null
+
+        fun updateBackendWs(url: String) {
+            activeInstance?.applyBackendWs(url)
+        }
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ class CoreVoiceService : Service(),
                     .setUsage(android.media.AudioAttributes.USAGE_ASSISTANT)
                     .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
-                val afReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                val afReq = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                     .setAudioAttributes(attrs)
                     .setAcceptsDelayedFocusGain(false)
                     .setOnAudioFocusChangeListener { /* no-op */ }
@@ -87,7 +87,8 @@ class CoreVoiceService : Service(),
                 audioFocusRequestCompat = afReq
                 audioFocusRequested = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             } else {
-                val res = am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                @Suppress("DEPRECATION")
+                val res = am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                 audioFocusRequested = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             }
             Log.d(TAG, "Audio focus requested: $audioFocusRequested")
@@ -107,6 +108,7 @@ class CoreVoiceService : Service(),
                 val afReq = audioFocusRequestCompat as? android.media.AudioFocusRequest
                 if (afReq != null) am.abandonAudioFocusRequest(afReq)
             } else {
+                @Suppress("DEPRECATION")
                 am.abandonAudioFocus(null)
             }
             audioFocusRequested = false
@@ -127,14 +129,31 @@ class CoreVoiceService : Service(),
     private var audioStreamer:   AudioStreamer?   = null
     private var backendWsUrl:    String? = null
     private var awaitingCommandAfterAck: Boolean = false
+    private var lastBackendTranscript = ""
+    private val dispatchedActionLock = Any()
+    private var lastDispatchedActionSignature = ""
+    private var lastDispatchedActionAtMs = 0L
+    @Volatile private var serviceDestroyed = false
+    private val backendResponseHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var backendFallbackPending = false
+
+    private val backendFallbackRunnable = Runnable {
+        if (!serviceDestroyed && backendFallbackPending && serviceState == ServiceState.LISTENING) {
+            backendFallbackPending = false
+            Log.w(TAG, "Backend response timeout; falling back to local STT")
+            requestAudioFocus()
+            sttEngine.startListening()
+        }
+    }
 
     // ── Audio loop ────────────────────────────────────────────────────────────
     private var audioRecord: AudioRecord? = null
+    private val audioRecordLock = Any()
     private var audioJob:    Job?         = null
-    private val scope = CoroutineScope(Dispatchers.IO)
+    private var captureJob: Job? = null
+    private val serviceJob = Job()
+    private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    // ── VAD silence counter ───────────────────────────────────────────────────
-    // We keep the audio loop for wake-word detection only; STT is done by LocalSttEngine
     private val PICOVOICE_ACCESS_KEY = "YOUR_PICOVOICE_ACCESS_KEY_HERE"
     private var lastWakeAtMs = 0L
     private var lastFailedListenAtMs = 0L
@@ -145,9 +164,11 @@ class CoreVoiceService : Service(),
 
     override fun onCreate() {
         super.onCreate()
+        serviceDestroyed = false
         Log.d(TAG, "Service created")
         createNotificationChannel()
         prefs = getSharedPreferences("hey_bro_settings", Context.MODE_PRIVATE)
+        activeInstance = this
 
         overlayManager = OverlayManager(this)
         sttEngine      = LocalSttEngine(this)
@@ -157,29 +178,10 @@ class CoreVoiceService : Service(),
         sttEngine.initialize(this)
         ttsEngine.initialize(this)
 
-        // Initialize optional backend audio streamer if user configured a WS URL
         try {
-            val prefs = getSharedPreferences("hey_bro_settings", Context.MODE_PRIVATE)
-            backendWsUrl = prefs.getString("backend_ws", null)
+            backendWsUrl = prefs.getString(KEY_BACKEND_WS, DEFAULT_BACKEND_WS)
             if (!backendWsUrl.isNullOrBlank()) {
-                audioStreamer = AudioStreamer(object : AudioStreamerListener {
-                    override fun onResponseComplete() { /* no-op */ }
-                    override fun onConnectionStateChanged(connected: Boolean) {
-                        Log.i(TAG, "AudioStreamer connected=$connected")
-                    }
-                    override fun onTranscriptReceived(text: String) {
-                        // Called when backend returns a transcript; treat like STT result
-                        onResult(text)
-                    }
-                    override fun onSpokenTextReceived(text: String) {
-                        ttsEngine.speak(text)
-                    }
-                    override fun onActionReceived(payload: String) {
-                        // Backend sent an action JSON – execute it
-                        DeviceOperatorService.instance?.executeCommand(payload)
-                    }
-                })
-                audioStreamer?.connect(backendWsUrl!!)
+                configureBackendStreamer()
             }
         } catch (e: Exception) {
             Log.w(TAG, "AudioStreamer init failed: ${e.message}")
@@ -191,7 +193,166 @@ class CoreVoiceService : Service(),
         initVAD()
     }
 
+    private fun configureBackendStreamer() {
+        val url = backendWsUrl ?: return
+        audioStreamer = AudioStreamer(object : AudioStreamerListener {
+            override fun onResponseComplete() {
+                cancelBackendFallback()
+                abandonAudioFocus()
+                if (serviceState != ServiceState.IDLE) {
+                    resetToIdle()
+                    pushEvent(mapOf("state" to "IDLE"))
+                    overlayManager.hideDelayed(300)
+                }
+            }
+            override fun onConnectionStateChanged(connected: Boolean) {
+                Log.i(TAG, "AudioStreamer connected=$connected")
+                pushEvent(mapOf(
+                    "state" to (if (connected) "CONNECTED" else "DISCONNECTED"),
+                    "wsConnected" to (if (connected) "true" else "false")
+                ))
+                if (!connected && serviceState == ServiceState.LISTENING) {
+                    // Cloud capture cannot finish while the socket is down. Move
+                    // immediately to the local recognizer instead of leaving the
+                    // UI stuck in LISTENING until the backend timeout expires.
+                    backendFallbackPending = false
+                    backendResponseHandler.removeCallbacks(backendFallbackRunnable)
+                    captureJob?.cancel()
+                    requestAudioFocus()
+                    sttEngine.startListening()
+                }
+            }
+            override fun onTranscriptReceived(text: String) {
+                if (text.trim().matches(Regex("^[^\\p{L}\\p{N}]+$"))) {
+                    Log.d(TAG, "Ignoring punctuation-only backend transcript: '$text'")
+                    cancelBackendFallback()
+                    resetToIdle()
+                    pushEvent(mapOf("state" to "IDLE"))
+                    return
+                }
+                cancelBackendFallback()
+                lastBackendTranscript = text
+                transitionTo(ServiceState.PROCESSING)
+                pushEvent(mapOf("state" to "PROCESSING", "transcript" to text))
+                overlayManager.show(OverlayManager.State.PROCESSING)
+
+                // Keep device control functional when a deployed backend sends
+                // TRANSCRIPT/SPOKEN_TEXT but omits its separate action message.
+                // A matching backend action is deduplicated in dispatchDeviceCommand.
+                scope.launch(Dispatchers.Default) {
+                    var localResult = LocalCommandProcessor.process(text)
+                    if (isUnresolved(localResult)) {
+                        LocalCommandProcessor.interpretWithGemini(text)?.let { learnedResult ->
+                            localResult = learnedResult
+                            Log.i(TAG, "Gemini mapped cloud transcript: \"$text\"")
+                        }
+                    }
+                    localResult.action?.let {
+                        val actionName = it.optString("action")
+                        VoiceLearningStore.learn(text, actionName)
+                        dispatchDeviceCommand(it.toString())
+                    }
+                }
+            }
+            override fun onSpokenTextReceived(text: String) {
+                transitionTo(ServiceState.SPEAKING)
+                pushEvent(mapOf(
+                    "state" to "PLAYING",
+                    "transcript" to lastBackendTranscript,
+                    "response" to text
+                ))
+                overlayManager.show(OverlayManager.State.PLAYING, text.take(40))
+            }
+            override fun onActionReceived(payload: String) {
+                dispatchDeviceCommand(payload)
+            }
+        })
+        audioStreamer?.connect(url)
+    }
+
+    private fun dispatchDeviceCommand(payload: String, attemptsLeft: Int = 8) {
+        val operator = DeviceOperatorService.instance
+        if (operator == null) {
+            if (attemptsLeft > 0 && !serviceDestroyed) {
+                Log.w(TAG, "Accessibility service not ready; retrying device operation")
+                backendResponseHandler.postDelayed({
+                    dispatchDeviceCommand(payload, attemptsLeft - 1)
+                }, 250L)
+            } else {
+                Log.e(TAG, "Dropping device operation: accessibility service unavailable")
+            }
+            return
+        }
+
+        val signature = actionSignature(payload)
+        val now = SystemClock.elapsedRealtime()
+        synchronized(dispatchedActionLock) {
+            if (signature.isNotBlank() &&
+                signature == lastDispatchedActionSignature &&
+                now - lastDispatchedActionAtMs < 5_000L
+            ) {
+                Log.d(TAG, "Skipping duplicate device operation: $signature")
+                return
+            }
+            if (signature.isNotBlank()) {
+                lastDispatchedActionSignature = signature
+                lastDispatchedActionAtMs = now
+            }
+        }
+
+        Log.i(TAG, "Dispatching device operation: $payload")
+        operator.executeCommand(payload)
+    }
+
+    private fun actionSignature(payload: String): String {
+        return try {
+            val json = JSONObject(payload)
+            val action = json.optString("action")
+            val params = json.optJSONObject("params")
+            when (action) {
+                "flashlightOn", "flashlightOff" -> "flashlight:${action == "flashlightOn"}"
+                "volumeUp" -> "volume:up"
+                "volumeDown" -> "volume:down"
+                "mute" -> "volume:mute"
+                "globalBack" -> "global:back"
+                "globalHome" -> "global:home"
+                else -> "$action:${params?.toString() ?: json.toString()}"
+            }
+        } catch (_: Exception) {
+            ""
+        }
+    }
+
+    private fun applyBackendWs(url: String) {
+        val trimmed = url.trim()
+        Log.i(TAG, "Backend switch request: '$url'")
+        if (trimmed.isEmpty()) {
+            backendWsUrl = null
+            audioStreamer?.stopAll()
+            audioStreamer = null
+            pushEvent(mapOf("state" to "DISCONNECTED", "wsConnected" to "false"))
+            Log.i(TAG, "Backend: offline local engine")
+            return
+        }
+        backendWsUrl = trimmed
+        if (audioStreamer == null) {
+            configureBackendStreamer()
+        } else {
+            audioStreamer?.connect(trimmed)
+        }
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        try {
+            val saved = prefs.getString(KEY_BACKEND_WS, DEFAULT_BACKEND_WS)
+            val current = backendWsUrl ?: ""
+            if (saved != null && saved.trim() != current) {
+                applyBackendWs(saved)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Backend re-read failed: ${e.message}")
+        }
+
         if (intent?.action == "TRIGGER_MANUAL") {
             manualTrigger()
             return START_STICKY
@@ -207,21 +368,38 @@ class CoreVoiceService : Service(),
             .setContentText("Say \"Hey Bro\" to activate · Engine: $activeEngineName")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentIntent(pendingIntent)
+            .setSilent(true)
+            .setDefaults(0)
             .setOngoing(true)
             .build()
 
-        startForeground(NOTIFICATION_ID, notification)
-        startWakeWordLoop()
+        try {
+            startForeground(NOTIFICATION_ID, notification)
+            startWakeWordLoop()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Failed to start foreground service: ${e.message}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_STICKY
     }
 
     override fun onDestroy() {
-        audioJob?.cancel()
-        wakeWordManager?.release()
-        sileroVad?.close()
-        sttEngine.destroy()
-        ttsEngine.destroy()
-        overlayManager.destroy()
+        serviceDestroyed = true
+        cancelBackendFallback()
+        backendResponseHandler.removeCallbacksAndMessages(null)
+        try { audioStreamer?.stopAll() } catch (_: Exception) {}
+        audioStreamer = null
+        try { audioJob?.cancel() } catch (_: Exception) {}
+        releaseWakeRecorder()
+        try { wakeWordManager?.release() } catch (_: Exception) {}
+        try { sileroVad?.close() } catch (_: Exception) {}
+        try { sttEngine.destroy() } catch (_: Exception) {}
+        try { ttsEngine.destroy() } catch (_: Exception) {}
+        try { overlayManager.destroy() } catch (_: Exception) {}
+        try { serviceJob.cancel() } catch (_: Exception) {}
+        abandonAudioFocus()
+        activeInstance = null
         super.onDestroy()
         Log.d(TAG, "Service destroyed")
     }
@@ -244,17 +422,13 @@ class CoreVoiceService : Service(),
     // ─────────────────────────────────────────────────────────────────────────
 
     override fun onSpeechBegin() {
-        // Speech started – already in LISTENING state
         Log.d(TAG, "User began speaking")
-        // reset transient failure counter when the user actually speaks
         sttFailureCount = 0
-        // any retry flow is satisfied
         sttRetryInFlight = false
         abandonAudioFocus()
     }
 
     override fun onResult(transcript: String) {
-        // Successful result — reset failure counter and clear retry state
         sttFailureCount = 0
         sttRetryInFlight = false
         abandonAudioFocus()
@@ -264,23 +438,21 @@ class CoreVoiceService : Service(),
         pushEvent(mapOf("state" to "PROCESSING", "transcript" to transcript))
         overlayManager.show(OverlayManager.State.PROCESSING)
 
-        // Run command processing off the main thread
         scope.launch(Dispatchers.Default) {
             var result = LocalCommandProcessor.process(transcript)
-            if (result.reply.startsWith("Sorry, I didn't understand") || result.reply.contains("I’m ready to help")) {
+            if (isUnresolved(result)) {
                 LocalCommandProcessor.interpretWithGemini(transcript)?.let { geminiResult ->
                     result = geminiResult
                     Log.i(TAG, "Used Gemini fallback for transcript: \"$transcript\"")
                 }
             }
 
-            // Execute device action if any (must post to main thread)
             result.action?.let { actionJson ->
                 val actionStr = actionJson.optString("action")
                 Log.d(TAG, "Executing action: $actionStr")
+                VoiceLearningStore.learn(transcript, actionStr)
 
                 if (actionStr == "sleep") {
-                    // Stop listening and go truly idle
                     resetToIdle()
                     pushEvent(mapOf("state" to "IDLE"))
                     overlayManager.hideDelayed(500)
@@ -291,7 +463,6 @@ class CoreVoiceService : Service(),
                 DeviceOperatorService.instance?.executeCommand(actionJson.toString())
             }
 
-            // Speak the reply
             kotlinx.coroutines.withContext(Dispatchers.Main) {
                 transitionTo(ServiceState.SPEAKING)
                 pushEvent(mapOf("state" to "PLAYING", "response" to result.reply))
@@ -301,28 +472,29 @@ class CoreVoiceService : Service(),
         }
     }
 
+    private fun isUnresolved(result: LocalCommandProcessor.Result): Boolean {
+        return result.action == null && (
+            result.reply.startsWith("Sorry, I didn't understand") ||
+                result.reply.contains("ready to help", ignoreCase = true)
+            )
+    }
+
     override fun onError(errorCode: Int) {
         lastFailedListenAtMs = SystemClock.elapsedRealtime()
         sttFailureCount++
 
         val msg = when (errorCode) {
             SpeechRecognizer.ERROR_NO_MATCH       -> "I didn't catch that. Try again."
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> null  // silent – user just didn't speak
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> null
             SpeechRecognizer.ERROR_AUDIO          -> "Audio error. Please try again."
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission needed."
-            else                                  -> null  // suppress unknown errors silently
+            else                                  -> null
         }
 
         Log.w(TAG, "STT error $errorCode (count=$sttFailureCount)${if (msg != null) ": $msg" else " (silent)"}")
 
-        // For transient errors, attempt retries with increasing back-off before giving up
-        val retryDelays = longArrayOf(650L, 1200L, 2500L)
-        val shouldRetry = when (errorCode) {
-            SpeechRecognizer.ERROR_NO_MATCH,
-            SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
-            SpeechRecognizer.ERROR_AUDIO -> sttFailureCount <= retryDelays.size
-            else -> false
-        }
+        val retryDelays = longArrayOf(900L)
+        val shouldRetry = errorCode == SpeechRecognizer.ERROR_AUDIO && sttFailureCount <= retryDelays.size
 
         if (shouldRetry) {
             val idx = (sttFailureCount - 1).coerceAtLeast(0).coerceAtMost(retryDelays.size - 1)
@@ -330,7 +502,6 @@ class CoreVoiceService : Service(),
             Log.d(TAG, "Transient STT error; scheduling retry #$sttFailureCount (delay=${delayMs}ms)")
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                 try {
-                    // Keep LISTENING state so user can continue speaking
                     if (serviceState != ServiceState.LISTENING) {
                         transitionTo(ServiceState.LISTENING)
                         overlayManager.show(OverlayManager.State.LISTENING)
@@ -338,7 +509,6 @@ class CoreVoiceService : Service(),
                         updateNotification("I'm listening…")
                     }
 
-                    // mark that a retry flow is in-flight so wake engine is not reinitialized
                     sttRetryInFlight = true
                     requestAudioFocus()
 
@@ -346,7 +516,6 @@ class CoreVoiceService : Service(),
                         sttEngine.startListening()
                     } catch (e: Exception) {
                         Log.w(TAG, "Retry startListening failed: ${e.message}")
-                        // Fall through to final failure handling below
                     }
                 } catch (e: Exception) {
                     Log.w(TAG, "Retry startListening failed outer: ${e.message}")
@@ -355,9 +524,7 @@ class CoreVoiceService : Service(),
             return
         }
 
-        // Final failure: speak a helpful message (if one exists) and go idle
         android.os.Handler(android.os.Looper.getMainLooper()).post {
-            // Clear retry-in-flight and abandon audio focus
             sttRetryInFlight = false
             abandonAudioFocus()
 
@@ -383,17 +550,13 @@ class CoreVoiceService : Service(),
         Log.d(TAG, "TTS done")
         scope.launch(Dispatchers.Main) {
             if (awaitingCommandAfterAck) {
-                // This TTS was the "Yes, I'm listening" ack — begin STT capture now
                 awaitingCommandAfterAck = false
                 transitionTo(ServiceState.LISTENING)
                 overlayManager.show(OverlayManager.State.LISTENING)
                 pushEvent(mapOf("state" to "LISTENING"))
                 updateNotification("I'm listening…")
 
-                // Start backend capture if connected, otherwise local STT
-                // Small delay to ensure any TTS playback fully stops and audio focus is stable.
-                // Use configurable post-ack delay (defaults to 800ms) so we can tune on problematic devices.
-                val postTtsDelay = prefs.getLong("stt_post_tts_ms", 800L)
+                val postTtsDelay = prefs.getLong("stt_post_tts_ms", 100L).coerceIn(0L, 250L)
                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                     if (audioStreamer?.isConnected() == true) {
                         audioStreamer?.sendWakeWordTriggered()
@@ -401,10 +564,8 @@ class CoreVoiceService : Service(),
                         captureAndSendAudio()
                     } else {
                         try {
-                            // Try requesting audio focus and ensure it's granted before starting STT
                             val gotFocus = requestAudioFocus()
                             if (!gotFocus) {
-                                // Wait a bit longer for audio focus to stabilize, then try
                                 android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
                                     try {
                                         requestAudioFocus()
@@ -419,7 +580,6 @@ class CoreVoiceService : Service(),
                 }, postTtsDelay)
                 
             } else {
-                // Regular TTS reply finished — go idle
                 resetToIdle()
                 pushEvent(mapOf("state" to "IDLE"))
                 overlayManager.hideDelayed(800)
@@ -463,16 +623,48 @@ class CoreVoiceService : Service(),
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val notificationManager = getSystemService(NotificationManager::class.java)
+
+            // Android persists channel sound choices. Remove channels created by
+            // older builds so a previously selected notification sound cannot
+            // return after reinstalling or restarting the service.
+            notificationManager.deleteNotificationChannel(LEGACY_CHANNEL_ID_V1)
+            notificationManager.deleteNotificationChannel(LEGACY_CHANNEL_ID_V2)
+            notificationManager.deleteNotificationChannel(CHANNEL_ID)
+
             val channel = NotificationChannel(
-                CHANNEL_ID, "Hey Bro Service", NotificationManager.IMPORTANCE_LOW
-            ).also { it.description = "Foreground service for Hey Bro assistant" }
-            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+                CHANNEL_ID, "Hey Bro Service", NotificationManager.IMPORTANCE_MIN
+            ).also {
+                it.description = "Foreground service for Hey Bro assistant"
+                it.setSound(null, null)
+                it.enableVibration(false)
+                it.vibrationPattern = longArrayOf(0L)
+                it.enableLights(false)
+                it.setShowBadge(false)
+            }
+            notificationManager.createNotificationChannel(channel)
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  Wake word audio loop  (only runs wake word detection; STT is separate)
+    //  Wake word audio loop
     // ─────────────────────────────────────────────────────────────────────────
+
+    private fun releaseWakeRecorder(expected: AudioRecord? = null) {
+        synchronized(audioRecordLock) {
+            val recorder = audioRecord ?: return
+            if (expected != null && recorder !== expected) return
+            try {
+                if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    recorder.stop()
+                }
+            } catch (_: Exception) {}
+            try { recorder.release() } catch (_: Exception) {}
+            if (audioRecord === recorder) {
+                audioRecord = null
+            }
+        }
+    }
 
     @SuppressLint("MissingPermission")
     private fun startWakeWordLoop() {
@@ -485,6 +677,7 @@ class CoreVoiceService : Service(),
         }
 
         audioJob = scope.launch {
+            var recorder: AudioRecord? = null
             try {
                 val frameLength = wakeWordManager?.getRequiredFrameLength() ?: 512
                 val minBuf = AudioRecord.getMinBufferSize(
@@ -492,24 +685,35 @@ class CoreVoiceService : Service(),
                 )
                 val bufSize = maxOf(minBuf, frameLength * 2)
 
-                audioRecord = AudioRecord(
+                val createdRecorder = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     SAMPLE_RATE,
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT,
                     bufSize
                 )
-                audioRecord?.startRecording()
+                recorder = createdRecorder
+                synchronized(audioRecordLock) {
+                    audioRecord = createdRecorder
+                    createdRecorder.startRecording()
+                }
 
                 val buffer = ShortArray(frameLength)
 
                 Log.i(TAG, "Wake word audio loop started (engine: $activeEngineName)")
 
                 while (isActive) {
-                    val read = audioRecord?.read(buffer, 0, frameLength) ?: break
+                    val rec = synchronized(audioRecordLock) { audioRecord } ?: break
+                    if (rec !== recorder) break // Ownership changed
+                    if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) break
+                    
+                    val read = rec.read(buffer, 0, frameLength)
+                    if (read < 0) {
+                        Log.w(TAG, "Wake loop AudioRecord read error: $read")
+                        break
+                    }
                     if (read != frameLength) continue
 
-                    // Only check wake word when IDLE (not while STT is active)
                     if (serviceState == ServiceState.IDLE) {
                         if (wakeWordManager?.process(buffer) == true) {
                             Log.i(TAG, "Wake word detected by ${wakeWordManager?.getActiveEngineName()}")
@@ -521,9 +725,7 @@ class CoreVoiceService : Service(),
             } catch (e: Exception) {
                 Log.e(TAG, "Wake word loop error: ${e.message}")
             } finally {
-                audioRecord?.stop()
-                audioRecord?.release()
-                audioRecord = null
+                releaseWakeRecorder(recorder)
             }
         }
     }
@@ -534,7 +736,7 @@ class CoreVoiceService : Service(),
 
     private fun onWakeWordDetected() {
         val nowMs = SystemClock.elapsedRealtime()
-        if (serviceState != ServiceState.IDLE) return  // ignore if busy
+        if (serviceState != ServiceState.IDLE) return
         if (nowMs - lastWakeAtMs < 8_000L) {
             Log.d(TAG, "Wake cooldown active; ignoring extra trigger")
             return
@@ -545,6 +747,15 @@ class CoreVoiceService : Service(),
         }
 
         lastWakeAtMs = nowMs
+
+        try {
+            audioJob?.cancel()
+            audioJob = null
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to cancel audioJob: ${e.message}")
+        }
+        releaseWakeRecorder()
+
         transitionTo(ServiceState.LISTENING)
         playFeedback()
 
@@ -552,41 +763,40 @@ class CoreVoiceService : Service(),
         if (engineName.contains("Native", ignoreCase = true) ||
             engineName.contains("ViolaWake", ignoreCase = true) ||
             engineName.contains("HeyBroPhraseWakeEngine", ignoreCase = true)) {
-            // These engines hold a SpeechRecognizer internally. Stop them before the main command
-            // recognizer starts, otherwise Android creates concurrent recognition sessions and
-            // immediately stops the command listening flow.
             try {
                 wakeWordManager?.release()
-            } catch (_: Exception) {
-            }
+            } catch (_: Exception) {}
             activeEngineName = "None"
-        } else {
-            try {
-                if (audioRecord?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
-                    audioRecord?.stop()
-                }
-            } catch (_: Exception) {
-            }
         }
 
         overlayManager.show(OverlayManager.State.LISTENING)
-        pushEvent(mapOf("state" to "LISTENING"))
+        pushEvent(mapOf("state" to "LISTENING", "activeEngine" to activeEngineName))
         updateNotification("I'm listening…")
 
-        // Use configurable delays so the timing can be tuned per-device via prefs
-        val prefs = getSharedPreferences("hey_bro_settings", Context.MODE_PRIVATE)
-        val ackDelay = prefs.getLong("stt_ack_ms", 400L)
-        val sttStartDelay = prefs.getLong("stt_start_ms", 2200L)
-
+        val greetings = listOf(
+            "Hi Sandip, what can I do for you?",
+            "Hey Sandip, how can I help?",
+            "I'm listening, Sandip.",
+            "What's up, Sandip?"
+        )
+        
         awaitingCommandAfterAck = true
+        val ackDelay = prefs.getLong("stt_ack_ms", 250L)
         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-            ttsEngine.speak("Yes, I'm listening")
+            if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
+                ttsEngine.speak(greetings.random())
+            }
         }, ackDelay)
+    }
 
-        // Start STT after a configurable gap to avoid TTS/STT contention.
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+    fun manualTrigger() {
+        if (serviceState == ServiceState.IDLE) {
+            Log.d(TAG, "Manual push-to-talk trigger")
+            onWakeWordDetected()
+        } else if (serviceState == ServiceState.LISTENING) {
+            Log.d(TAG, "Manual push-to-talk restart")
+            captureJob?.cancel()
             if (audioStreamer?.isConnected() == true) {
-                Log.d(TAG, "Using backend AudioStreamer for STT capture")
                 audioStreamer?.sendWakeWordTriggered()
                 requestAudioFocus()
                 captureAndSendAudio()
@@ -594,15 +804,7 @@ class CoreVoiceService : Service(),
                 requestAudioFocus()
                 sttEngine.startListening()
             }
-        }, sttStartDelay)
-    }
-
-    fun manualTrigger() {
-        if (serviceState == ServiceState.IDLE) {
-            Log.d(TAG, "Manual push-to-talk trigger")
-            onWakeWordDetected()
         } else if (serviceState == ServiceState.SPEAKING) {
-            // Allow interrupting the response
             ttsEngine.stop()
             resetToIdle()
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
@@ -614,14 +816,15 @@ class CoreVoiceService : Service(),
     private fun resetToIdle() {
         transitionTo(ServiceState.IDLE)
         sileroVad?.resetStates()
+        captureJob?.cancel()
         sttEngine.stopListening()
 
-        // Resume AudioRecord if it was paused for STT
-        if (audioRecord?.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-            try { audioRecord?.startRecording() } catch (_: Exception) {}
+        synchronized(audioRecordLock) {
+            if (audioRecord?.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                try { audioRecord?.startRecording() } catch (_: Exception) {}
+            }
         }
 
-        // Re-init wake word engine if it was released (but defer while STT retries are in-flight)
         if (wakeWordManager?.activeEngine == null) {
             scheduleWakeReinit()
         }
@@ -629,7 +832,6 @@ class CoreVoiceService : Service(),
         updateNotification("Say \"Hey Bro\" to activate")
     }
 
-    // Schedule wake re-init but defer while transient STT retries are still happening.
     private fun scheduleWakeReinit(attemptsLeft: Int = 4) {
         if (wakeWordManager?.activeEngine != null) return
         if (attemptsLeft <= 0) {
@@ -641,9 +843,8 @@ class CoreVoiceService : Service(),
             return
         }
 
-        // If there are retries in flight, defer
         if (sttRetryInFlight || sttFailureCount > 0) {
-            Log.d(TAG, "Deferring WakeWordManager re-init due to STT retry state (inFlight=$sttRetryInFlight count=$sttFailureCount) attemptsLeft=$attemptsLeft")
+            Log.d(TAG, "Deferring WakeWordManager re-init due to STT retry state")
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 800)
             return
         }
@@ -652,7 +853,6 @@ class CoreVoiceService : Service(),
             initWakeWordEngine()
         } catch (e: Exception) {
             Log.w(TAG, "WakeWordManager re-init failed: ${e.message}")
-            // try again later
             android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 800)
         }
     }
@@ -673,7 +873,7 @@ class CoreVoiceService : Service(),
                 val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
                 val vibrator = vm.defaultVibrator
                 if (vibrator.hasVibrator()) {
-                    vibrator.vibrate(VibrationEffect.createOneShot(60, VibrationEffect.DEFAULT_AMPLITUDE))
+                    vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
                 }
             } else {
                 @Suppress("DEPRECATION")
@@ -690,28 +890,22 @@ class CoreVoiceService : Service(),
         } catch (e: Exception) {
             Log.w(TAG, "Vibration skipped: ${e.message}")
         }
-
-        try {
-            val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
-            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 130)
-        } catch (e: Exception) {
-            Log.w(TAG, "Tone skipped: ${e.message}")
-        }
     }
 
     @SuppressLint("MissingPermission")
     private fun captureAndSendAudio() {
-        scope.launch {
+        captureJob?.cancel()
+        captureJob = scope.launch {
+            var recorder: AudioRecord? = null
             try {
-                // Stop local STT to avoid conflicts
                 try { sttEngine.stopListening() } catch (_: Exception) {}
 
                 val sampleRate = SAMPLE_RATE
-                val frameSize = 1024
+                val frameSize = 512
                 val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                 val bufSize = maxOf(minBuf, frameSize * 2)
 
-                val recorder = AudioRecord(
+                recorder = AudioRecord(
                     MediaRecorder.AudioSource.MIC,
                     sampleRate,
                     AudioFormat.CHANNEL_IN_MONO,
@@ -723,31 +917,58 @@ class CoreVoiceService : Service(),
                 val shortBuf = ShortArray(frameSize)
                 var speechDetected = false
                 var silenceFrames = 0
-                val maxSilenceFrames = 20 // approx 20 frames ~ 640ms (frame duration ~32ms)
-                val maxDurationMs = 12_000L
+                val maxSilenceFrames = 14
+                val noSpeechTimeoutMs = 4_000L
+                val maxDurationMs = 10_000L
                 val startMs = SystemClock.elapsedRealtime()
 
                 Log.d(TAG, "Backend capture started")
 
-                while (SystemClock.elapsedRealtime() - startMs < maxDurationMs) {
-                    val r = recorder.read(shortBuf, 0, frameSize)
-                    if (r <= 0) continue
+                while (isActive && SystemClock.elapsedRealtime() - startMs < maxDurationMs) {
+                    if (audioStreamer?.isConnected() != true) {
+                        Log.w(TAG, "Backend disconnected during capture; handing off to local STT")
+                        requestAudioFocus()
+                        try { sttEngine.startListening() } catch (fallbackError: Exception) {
+                            Log.w(TAG, "Local STT fallback failed: ${fallbackError.message}")
+                        }
+                        return@launch
+                    }
 
-                    val prob = try { sileroVad?.isSpeech(shortBuf, sampleRate) ?: 0f } catch (_: Exception) { 0f }
+                    val r = recorder.read(shortBuf, 0, frameSize)
+                    if (r < 0) {
+                        Log.w(TAG, "Backend capture AudioRecord read error: $r")
+                        break
+                    }
+                    if (r == 0) continue
+
+                    if (!speechDetected && SystemClock.elapsedRealtime() - startMs >= noSpeechTimeoutMs) {
+                        Log.d(TAG, "No speech detected within ${noSpeechTimeoutMs}ms")
+                        // Do not send an empty buffer to the backend. Some STT
+                        // providers turn silence into punctuation and trigger
+                        // an unnecessary spoken response.
+                        resetToIdle()
+                        pushEvent(mapOf("state" to "IDLE"))
+                        break
+                    }
+
+                    val vadScore = try { sileroVad?.isSpeech(shortBuf, sampleRate) ?: -1f } catch (_: Exception) { -1f }
+                    val energy = shortBuf.take(r).sumOf { sample ->
+                        val normalized = sample.toDouble() / Short.MAX_VALUE
+                        normalized * normalized
+                    }.let { kotlin.math.sqrt(it / r.coerceAtLeast(1)) }.toFloat()
+                    val prob = if (vadScore >= 0f) vadScore else if (energy >= 0.010f) 0.8f else 0.05f
                     if (!speechDetected) {
-                        if (prob > 0.45f) {
+                        if (prob > 0.30f || energy >= 0.010f) {
                             speechDetected = true
-                            Log.d(TAG, "Speech started (prob=$prob)")
                         }
                     } else {
-                        if (prob < 0.3f) {
+                        if (prob < 0.20f && energy < 0.006f) {
                             silenceFrames++
                         } else {
                             silenceFrames = 0
                         }
                     }
 
-                    // Convert shorts to little-endian bytes
                     val bytes = ByteArray(r * 2)
                     var bi = 0
                     for (i in 0 until r) {
@@ -756,7 +977,6 @@ class CoreVoiceService : Service(),
                         bytes[bi++] = ((s.toInt() shr 8) and 0xFF).toByte()
                     }
 
-                    // Send to backend
                     try { audioStreamer?.sendAudioChunk(bytes) } catch (e: Exception) { Log.w(TAG, "sendAudioChunk failed: ${e.message}") }
 
                     if (speechDetected && silenceFrames >= maxSilenceFrames) {
@@ -765,27 +985,41 @@ class CoreVoiceService : Service(),
                     }
                 }
 
-                try { audioStreamer?.sendEndOfSpeech() } catch (e: Exception) { Log.w(TAG, "sendEndOfSpeech failed: ${e.message}") }
+                if (speechDetected) {
+                    try { audioStreamer?.sendEndOfSpeech() } catch (e: Exception) { Log.w(TAG, "sendEndOfSpeech failed: ${e.message}") }
+                }
 
-                try {
-                    recorder.stop()
-                } catch (_: Exception) {}
-                try {
-                    recorder.release()
-                } catch (_: Exception) {}
-
-                Log.d(TAG, "Backend capture finished; waiting for transcript from server")
+                Log.d(TAG, "Backend capture finished; waiting for transcript")
+                scheduleBackendFallback()
 
             } catch (e: Exception) {
                 Log.e(TAG, "captureAndSendAudio error: ${e.message}")
-                try { sttEngine.startListening() } catch (_: Exception) {}
+                if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
+                    requestAudioFocus()
+                    try { sttEngine.startListening() } catch (_: Exception) {}
+                }
+            } finally {
+                try {
+                    recorder?.stop()
+                } catch (_: Exception) {}
+                try {
+                    recorder?.release()
+                } catch (_: Exception) {}
+                captureJob = null
             }
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  EventChannel + Notification helpers
-    // ─────────────────────────────────────────────────────────────────────────
+    private fun scheduleBackendFallback() {
+        backendResponseHandler.removeCallbacks(backendFallbackRunnable)
+        backendFallbackPending = true
+        backendResponseHandler.postDelayed(backendFallbackRunnable, 6_000L)
+    }
+
+    private fun cancelBackendFallback() {
+        backendFallbackPending = false
+        backendResponseHandler.removeCallbacks(backendFallbackRunnable)
+    }
 
     private fun pushEvent(data: Map<String, String>) {
         val json = JSONObject(data).toString()
@@ -795,13 +1029,6 @@ class CoreVoiceService : Service(),
     }
 
     private fun updateNotification(text: String) {
-        val nm = getSystemService(NotificationManager::class.java)
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Hey Bro")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setOngoing(true)
-            .build()
-        nm.notify(NOTIFICATION_ID, notification)
+        Log.d(TAG, "Service state notification: $text")
     }
 }
