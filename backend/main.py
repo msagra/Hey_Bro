@@ -757,9 +757,9 @@ async def chat_endpoint(payload: dict):
     messages.append({"role": "user", "content": message})
 
     if provider == "groq" and groq_async_client:
-        selected_model = model or "groq/compound"
-        if selected_model == "llama-3.3-70b-versatile":
-            selected_model = "groq/compound"
+        selected_model = model or "openai/gpt-oss-120b"
+        if selected_model == "llama-3.3-70b-versatile" or selected_model == "groq/compound":
+            selected_model = "openai/gpt-oss-120b"
         try:
             response = await groq_async_client.chat.completions.create(
                 model=selected_model, messages=messages, temperature=0.4, max_tokens=800
