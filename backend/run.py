@@ -7,7 +7,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=False,   # disable reload in production to avoid double-startup
+        reload=True,   # enable reload in development
         log_level="info",
         ws_ping_interval=20,
         ws_ping_timeout=30,
