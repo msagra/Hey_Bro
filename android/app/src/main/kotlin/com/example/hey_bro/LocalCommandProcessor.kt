@@ -1,13 +1,16 @@
 package com.example.hey_bro
 
+import android.content.Context
+import android.os.BatteryManager
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
 
 /**
  * Fully local, zero-network command parser.
  *
- * Takes a raw transcript string (from on-device STT) and returns a JSON
+ * Takes a raw transcript string (from on-device STT or backend) and returns a JSON
  * action payload that DeviceOperatorService can execute directly, OR
  * a spoken reply string that the TTS engine should speak.
  */
@@ -15,8 +18,10 @@ object LocalCommandProcessor {
 
     private const val TAG = "LocalCommandProcessor"
     private var geminiBridge: GeminiIntentBridge? = null
+    private var appContext: Context? = null
 
-    fun initialize(context: android.content.Context) {
+    fun initialize(context: Context) {
+        appContext = context.applicationContext
         VoiceLearningStore.initialize(context)
         geminiBridge = GeminiIntentBridge(context)
     }
@@ -32,18 +37,73 @@ object LocalCommandProcessor {
 
     // ─────────────────────────────────────────────────────────────────────────
     fun process(transcript: String): Result {
-        val t = transcript.trim().lowercase()
-        Log.d(TAG, "Processing: \"$t\"")
+        val t = normalizeCommand(transcript)
+        Log.d(TAG, "Processing normalized: \"$t\" (raw: \"$transcript\")")
 
+        // 1. Check VoiceLearningStore
         val learnedAction = VoiceLearningStore.findActionForTranscript(t)
         if (learnedAction != null) {
             return actionResultFromName(learnedAction)
         }
 
-        val result = when {
+        // 2. Check Compound Commands ("and then", "after that", "then", "and")
+        val compoundResult = checkCompoundCommands(transcript, t)
+        if (compoundResult != null) {
+            return compoundResult
+        }
+
+        // 3. Process Single Command
+        val singleResult = processSingle(t, transcript)
+
+        if (singleResult.action != null) {
+            val actionName = singleResult.action.optString("action", "")
+            if (actionName.isNotBlank() && actionName != "MULTI_ACTION") {
+                VoiceLearningStore.learn(transcript, actionName)
+            }
+        }
+
+        return singleResult
+    }
+
+    private fun checkCompoundCommands(rawTranscript: String, normalized: String): Result? {
+        val delimiters = listOf(" and then ", " after that ", " and also ", " then ")
+        for (delim in delimiters) {
+            if (normalized.contains(delim)) {
+                val parts = normalized.split(delim).map { it.trim() }.filter { it.isNotBlank() }
+                if (parts.size >= 2) {
+                    val subActions = mutableListOf<JSONObject>()
+                    val subReplies = mutableListOf<String>()
+
+                    for (part in parts) {
+                        val subResult = processSingle(part, part)
+                        if (subResult.action != null) {
+                            subActions.add(subResult.action)
+                            subReplies.add(subResult.reply)
+                        }
+                    }
+
+                    if (subActions.size >= 2) {
+                        val multi = JSONObject().apply {
+                            put("action", "MULTI_ACTION")
+                            val arr = JSONArray()
+                            subActions.forEach { arr.put(it) }
+                            put("actions", arr)
+                        }
+                        val combinedReply = subReplies.joinToString(", and ")
+                        Log.i(TAG, "Compound command resolved into ${subActions.size} actions")
+                        return Result(multi, combinedReply)
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun processSingle(t: String, rawTranscript: String): Result {
+        return when {
 
             // ── Basic lock-screen-safe commands ──────────────────────────────
-            t.containsAny("set timer for", "start timer", "timer for") -> {
+            t.containsAny("set timer for", "start timer", "timer for", "set timer") -> {
                 val seconds = extractDurationSeconds(t)
                 Result(
                     JSONObject().apply {
@@ -54,7 +114,7 @@ object LocalCommandProcessor {
                 )
             }
 
-            t.containsAny("set alarm", "set an alarm", "wake me up", "alarm for") -> {
+            t.containsAny("set alarm", "set an alarm", "wake me up", "alarm for", "create alarm") -> {
                 val (h, m) = extractTime(t)
                 val label  = extractAlarmLabel(t)
                 Result(
@@ -68,11 +128,11 @@ object LocalCommandProcessor {
                 )
             }
 
-            t.containsAny("open camera", "launch camera", "camera on") ->
+            t.containsAny("open camera", "launch camera", "camera on", "start camera") ->
                 Result(action("openCamera"), "Opening camera")
 
             t.containsAny("take a photo", "take photo", "click a photo", "capture photo",
-                "take a picture", "take picture", "click picture") -> {
+                "take a picture", "take picture", "click picture", "snap photo") -> {
                 val delay = extractDelay(t)
                 Result(
                     JSONObject().apply {
@@ -83,7 +143,7 @@ object LocalCommandProcessor {
                 )
             }
 
-            t.containsAny("take a selfie", "click selfie", "front camera selfie") -> {
+            t.containsAny("take a selfie", "take selfie", "click selfie", "front camera selfie", "capture selfie") -> {
                 val delay = extractDelay(t)
                 Result(
                     JSONObject().apply {
@@ -94,38 +154,54 @@ object LocalCommandProcessor {
                 )
             }
 
-            t.containsAny("call ", "dial ", "phone ") && !t.containsAny("call me", "phone me") -> {
-                val contact = extractCallTarget(t)
+            t.containsAny("read my notification", "read notification", "read notifications", "read my message", "read message", "read messages", "any new message", "any new notification", "what did ", "latest notification") -> {
+                val contact = if (t.contains("what did ")) {
+                    t.substringAfter("what did ").substringBefore(" say").trim()
+                } else null
+                val summary = HeyBroNotificationListenerService.getLatestMessagesSummary(contact)
+                Result(null, summary)
+            }
+
+            t.startsWith("reply to ") || t.startsWith("reply saying ") || t.startsWith("reply that ") || t.contains("send reply") -> {
+                val (contactOrApp, replyMsg) = extractReplyContactAndMessage(t)
+                val targetPkg = when {
+                    contactOrApp.contains("whatsapp") -> "com.whatsapp"
+                    contactOrApp.contains("telegram") -> "org.telegram.messenger"
+                    contactOrApp.contains("signal") -> "org.thoughtcrime.securesms"
+                    else -> ""
+                }
+                Result(
+                    JSONObject().apply {
+                        put("action", "replyNotification")
+                        put("packageName", targetPkg)
+                        put("contact", contactOrApp)
+                        put("message", replyMsg)
+                    },
+                    if (replyMsg.isNotBlank()) "Replying: $replyMsg" else "Replying to message"
+                )
+            }
+
+            t.containsAny("call ", "dial ", "phone ") && !t.containsAny("call me", "phone me", "call log") -> {
+                val (contact, simSlot) = extractCallTargetAndSim(t)
                 Result(
                     JSONObject().apply {
                         put("action", "makeCall")
                         put("number", contact)
+                        if (simSlot != null) put("simSlot", simSlot)
                     },
-                    "Calling $contact"
+                    "Calling $contact${if (simSlot != null) " from SIM $simSlot" else ""}"
                 )
             }
 
             t.containsAny(
-                "turn on flashlight",
-                "flashlight on",
-                "turn on torch",
-                "torch on",
-                "turn on flash",
-                "flash on",
-                "turn on light",
-                "light on"
+                "turn on flashlight", "flashlight on", "turn on torch", "torch on",
+                "turn on flash", "turn flash on", "turn on the flashlight", "flash on", "light on"
             ) ->
                 Result(action("flashlightOn"), "Turning on flashlight")
 
             t.containsAny(
-                "turn off flashlight",
-                "flashlight off",
-                "turn off torch",
-                "torch off",
-                "turn off flash",
-                "flash off",
-                "turn off light",
-                "light off"
+                "turn off flashlight", "flashlight off", "turn off torch", "torch off",
+                "turn off flash", "turn flash off", "turn off the flashlight", "flash off", "light off"
             ) ->
                 Result(action("flashlightOff"), "Turning off flashlight")
 
@@ -135,37 +211,88 @@ object LocalCommandProcessor {
             t.containsAny("hotspot off", "turn off hotspot", "disable hotspot") ->
                 Result(action("toggleHotspot", "enabled" to "false"), "Turning off hotspot")
 
-            t.containsAny("open settings", "device settings", "settings") ->
-                Result(action("openSettings", "setting" to "main"), "Opening settings")
+            t.containsAny("wifi on", "turn on wifi", "enable wifi") ->
+                Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
 
-            t.containsAny("volume up", "increase volume", "louder") ->
+            t.containsAny("wifi off", "turn off wifi", "disable wifi") ->
+                Result(action("toggleWifi", "enabled" to "false"), "Turning off Wi-Fi")
+
+            t.containsAny("bluetooth on", "turn on bluetooth", "enable bluetooth") ->
+                Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
+
+            t.containsAny("bluetooth off", "turn off bluetooth", "disable bluetooth") ->
+                Result(action("toggleBluetooth", "enabled" to "false"), "Turning off Bluetooth")
+
+            t.containsAny("airplane mode on", "turn on airplane", "enable airplane") ->
+                Result(action("toggleAirplaneMode", "enabled" to "true"), "Turning on Airplane mode")
+
+            t.containsAny("airplane mode off", "turn off airplane", "disable airplane") ->
+                Result(action("toggleAirplaneMode", "enabled" to "false"), "Turning off Airplane mode")
+
+            t.containsAny("battery saver on", "turn on battery saver", "enable battery saver") ->
+                Result(action("batterySaver"), "Opening Battery Saver settings")
+
+            t.containsAny("do not disturb", "turn on dnd", "enable dnd") ->
+                Result(action("doNotDisturb"), "Opening Do Not Disturb settings")
+
+            t.containsAny("auto rotate", "screen rotation") ->
+                Result(action("autoRotate"), "Opening Display settings for rotation")
+
+            t.containsAny("take a screenshot", "take screenshot", "capture screen", "screenshot") ->
+                Result(action("screenshot"), "Taking screenshot")
+
+            t.containsAny("go back", "press back", "navigate back", "back") && !t.contains("back to") ->
+                Result(action("globalBack"), "Going back")
+
+            t.containsAny("go home", "press home", "home screen") ->
+                Result(action("globalHome"), "Going home")
+
+            t.containsAny("open notification", "show notification", "notifications") ->
+                Result(action("notifications"), "Opening notifications")
+
+            t.containsAny("quick settings", "open quick settings") ->
+                Result(action("quickSettings"), "Opening quick settings")
+
+            t.containsAny("recent apps", "show recents", "open recents", "overview") ->
+                Result(action("recents"), "Showing recent apps")
+
+            t.containsAny("lock screen", "lock phone", "lock device") ->
+                Result(action("lockScreen"), "Locking screen")
+
+            // ── Volume / Media ───────────────────────────────────────────────
+            t.containsAny("volume up", "increase volume", "raise volume", "louder") ->
                 Result(action("volumeUp"), "Increasing volume")
 
-            t.containsAny("volume down", "decrease volume", "lower volume", "quieter") ->
+            t.containsAny("volume down", "decrease volume", "lower volume", "softer", "reduce volume") ->
                 Result(action("volumeDown"), "Decreasing volume")
 
-            t.containsAny("mute", "silence") ->
-                Result(action("mute"), "Muted")
+            t.containsAny("mute", "silence phone", "mute volume") ->
+                Result(action("mute"), "Muting volume")
 
-            t.containsAny("what time", "current time", "what's the time") -> {
-                val cal = Calendar.getInstance()
-                val reply = "It's ${formatTime(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))}"
-                Result(null, reply)
-            }
+            t.containsAny("pause music", "pause video", "stop music", "resume music", "play pause", "pause media") ->
+                Result(action("mediaPlayPause"), "Toggling playback")
 
-            t.containsAny("what date", "today's date", "what day") -> {
-                val cal = Calendar.getInstance()
-                val days = listOf("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday")
-                val months = listOf("January","February","March","April","May","June","July","August","September","October","November","December")
-                val reply = "Today is ${days[cal.get(Calendar.DAY_OF_WEEK)-1]}, ${months[cal.get(Calendar.MONTH)]} ${cal.get(Calendar.DAY_OF_MONTH)}"
-                Result(null, reply)
-            }
+            t.containsAny("next song", "next track", "skip song", "next video") ->
+                Result(action("mediaNext"), "Skipping to next")
 
-            // ── Unlocked-only commands ────────────────────────────────────────
-            t.containsAny("open whatsapp", "open what's app", "launch whatsapp") ->
-                Result(action("openApp", "appName" to "WhatsApp"), "Opening WhatsApp")
+            t.containsAny("previous song", "previous track", "last song") ->
+                Result(action("mediaPrevious"), "Going to previous")
 
-            t.matchesSend("whatsapp") -> {
+            // ── Scroll / Gestures ─────────────────────────────────────────────
+            t.containsAny("scroll down", "page down", "swipe down") ->
+                Result(action("scrollDown"), "Scrolling down")
+
+            t.containsAny("scroll up", "page up", "swipe up") ->
+                Result(action("scrollUp"), "Scrolling up")
+
+            t.containsAny("swipe left") ->
+                Result(action("swipeLeft"), "Swiping left")
+
+            t.containsAny("swipe right") ->
+                Result(action("swipeRight"), "Swiping right")
+
+            // ── WhatsApp & Messages ──────────────────────────────────────────
+            t.containsAny("send whatsapp to", "whatsapp to", "send message to", "message to") -> {
                 val (contact, msg) = extractContactAndMessage(t)
                 Result(
                     JSONObject().apply {
@@ -173,119 +300,74 @@ object LocalCommandProcessor {
                         put("contact", contact)
                         put("message", msg)
                     },
-                    if (contact.isNotBlank()) "Sending WhatsApp message to $contact"
-                    else "Opening WhatsApp to send a message"
+                    "Sending WhatsApp message to $contact"
                 )
             }
 
-            t.startsWith("open ") || t.startsWith("launch ") -> {
-                val appName = extractAppName(t)
-                Result(action("openApp", "appName" to appName), "Opening $appName")
-            }
-
-            t.containsAny("search for", "search ", "google ", "look up", "find ") -> {
-                val query = extractSearchQuery(t)
-                Result(action("searchWeb", "query" to query), "Searching for $query")
-            }
-
-            t.containsAny("navigate to", "directions to", "maps to", "open maps") -> {
-                val query = extractLocationQuery(t)
-                Result(action("openMaps", "query" to query), if (query.isBlank()) "Opening Maps" else "Opening directions to $query")
-            }
-
-            t.containsAny("play on youtube", "youtube ") -> {
-                val query = extractMediaQuery(t, "youtube")
+            t.containsAny("send sms to", "send text to") -> {
+                val (contact, msg) = extractContactAndMessage(t)
                 Result(
                     JSONObject().apply {
-                        put("action", "playMedia"); put("query", query); put("app", "YouTube")
+                        put("action", "sendSms")
+                        put("number", contact)
+                        put("message", msg)
                     },
-                    "Playing $query on YouTube"
+                    "Sending SMS to $contact"
                 )
             }
 
-            t.containsAny("play on spotify", "spotify ") -> {
-                val query = extractMediaQuery(t, "spotify")
+            // ── App Launching ─────────────────────────────────────────────────
+            t.containsAny("open ", "launch ", "start ") && !t.containsAny("open camera", "open maps", "open settings", "open notification", "open quick settings", "open recents") -> {
+                val app = extractAppName(t)
                 Result(
                     JSONObject().apply {
-                        put("action", "playMedia"); put("query", query); put("app", "Spotify")
+                        put("action", "openApp")
+                        put("appName", app)
                     },
-                    "Playing $query on Spotify"
+                    "Opening $app"
                 )
             }
 
-            t.startsWith("play ") -> {
-                val query = t.removePrefix("play ").trim()
+            // ── Media Playback ────────────────────────────────────────────────
+            t.containsAny("play ") && !t.containsAny("play pause") -> {
+                val app = if (t.contains("spotify")) "Spotify" else "YouTube"
+                val q = extractMediaQuery(t, app)
                 Result(
                     JSONObject().apply {
-                        put("action", "playMedia"); put("query", query); put("app", "YouTube")
+                        put("action", "playMedia")
+                        put("query", q)
+                        put("app", app)
                     },
-                    "Playing $query"
+                    "Playing $q on $app"
                 )
             }
 
-            t.containsAny("go back", "press back", "back button") ->
-                Result(action("globalBack"), "Going back")
-
-            t.containsAny("go home", "press home", "home screen") ->
-                Result(action("globalHome"), "Going to home screen")
-
-            t.containsAny("take screenshot", "screenshot", "capture screen") ->
-                Result(action("screenshot"), "Taking a screenshot")
-
-            t.containsAny("scroll down", "scroll up") -> {
-                val up = t.contains("scroll up")
-                Result(action(if (up) "scrollUp" else "scrollDown"), if (up) "Scrolling up" else "Scrolling down")
+            // ── Web Search & Navigation ───────────────────────────────────────
+            t.containsAny("search for ", "search ", "google ", "look up ") -> {
+                val q = extractSearchQuery(t)
+                Result(
+                    JSONObject().apply {
+                        put("action", "searchWeb")
+                        put("query", q)
+                    },
+                    "Searching for $q"
+                )
             }
 
-            t.containsAny("open wifi", "wi-fi settings", "wifi settings") ->
-                Result(action("openSettings", "setting" to "wifi"), "Opening WiFi settings")
+            t.containsAny("navigate to ", "directions to ", "maps to ", "open maps") -> {
+                val loc = extractLocationQuery(t)
+                Result(
+                    JSONObject().apply {
+                        put("action", "openMaps")
+                        put("query", loc)
+                    },
+                    if (loc.isNotBlank()) "Navigating to $loc" else "Opening Maps"
+                )
+            }
 
-            t.containsAny("open bluetooth", "bluetooth settings") ->
-                Result(action("openSettings", "setting" to "bluetooth"), "Opening Bluetooth settings")
-
-            t.containsAny(
-                "turn on wifi",
-                "enable wifi",
-                "wifi on",
-                "turn wifi on",
-                "wi fi on",
-                "wifi enabled"
-            ) ->
-                Result(action("toggleWifi", "enabled" to "true"), "Turning on WiFi")
- 
-            t.containsAny(
-                "turn off wifi",
-                "disable wifi",
-                "wifi off",
-                "turn wifi off",
-                "wi fi off",
-                "wifi disabled"
-            ) ->
-                Result(action("toggleWifi", "enabled" to "false"), "Turning off WiFi")
- 
-            t.containsAny(
-                "turn on bluetooth",
-                "enable bluetooth",
-                "bluetooth on",
-                "turn bluetooth on",
-                "blue tooth on"
-            ) ->
-                Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
- 
-            t.containsAny(
-                "turn off bluetooth",
-                "disable bluetooth",
-                "bluetooth off",
-                "turn bluetooth off",
-                "blue tooth off"
-            ) ->
-                Result(action("toggleBluetooth", "enabled" to "false"), "Turning off Bluetooth")
- 
-            t.containsAny("airplane mode on", "turn on airplane mode") ->
-                Result(action("toggleAirplaneMode", "enabled" to "true"), "Turning on Airplane mode")
- 
-            t.containsAny("airplane mode off", "turn off airplane mode") ->
-                Result(action("toggleAirplaneMode", "enabled" to "false"), "Turning off Airplane mode")
+            // ── Settings ─────────────────────────────────────────────────────
+            t.containsAny("open settings", "phone settings", "device settings") ->
+                Result(action("openSettings", "setting" to ""), "Opening Settings")
 
             t.containsAny("brightness up", "increase brightness") ->
                 Result(action("adjustBrightness", "direction" to "up"), "Increasing brightness")
@@ -293,12 +375,28 @@ object LocalCommandProcessor {
             t.containsAny("brightness down", "decrease brightness") ->
                 Result(action("adjustBrightness", "direction" to "down"), "Decreasing brightness")
 
-            // ── General / social / utility ─────────────────────────────────────
+            // ── General / Social / Info ──────────────────────────────────────
+            t.containsAny("what is the time", "what time is it", "tell me time", "current time") -> {
+                val cal = Calendar.getInstance()
+                Result(null, "It is ${formatTime(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))}.")
+            }
+
+            t.containsAny("what is the date", "today's date", "what day is it", "current date") -> {
+                val cal = Calendar.getInstance()
+                val dateStr = "${cal.getDisplayName(Calendar.DAY_OF_WEEK, Calendar.LONG, java.util.Locale.getDefault())}, ${cal.getDisplayName(Calendar.MONTH, Calendar.LONG, java.util.Locale.getDefault())} ${cal.get(Calendar.DAY_OF_MONTH)}"
+                Result(null, "Today is $dateStr.")
+            }
+
+            t.containsAny("battery level", "battery percentage", "how much battery") -> {
+                val level = getBatteryPercentage()
+                Result(null, if (level >= 0) "Your battery is at $level percent." else "Battery information unavailable.")
+            }
+
             t.containsAny("hello", "hi bro", "hey there", "what's up") ->
                 Result(null, "Hey! I'm ready. What do you need?")
 
             t.containsAny("who are you", "what are you", "your name") ->
-                Result(null, "I'm Hey Bro, your local AI assistant. I run entirely on your device, no internet needed.")
+                Result(null, "I'm Hey Bro, your AI voice assistant. I run locally and connect to the cloud when needed.")
 
             t.containsAny("thank you", "thanks") ->
                 Result(null, "Anytime! I'm here when you need me.")
@@ -309,34 +407,270 @@ object LocalCommandProcessor {
             t.containsAny("tell me a joke", "say a joke", "joke") ->
                 Result(null, jokes.random())
 
-            t.containsAny("stop listening", "go to sleep", "goodbye", "bye bro") ->
+            t.containsAny("stop listening", "go to sleep", "goodbye", "bye bro", "sleep") ->
                 Result(action("sleep"), "Going to sleep. Say Hey Bro to wake me up.")
 
             else -> {
-                Log.d(TAG, "No rule matched for: \"$t\"")
-                Result(null, "Sorry, I didn't understand \"$transcript\". Try saying something like: set alarm, call mom, turn on flashlight, open WhatsApp, search for news, or play music.")
+                Log.d(TAG, "No local rule matched for: \"$t\", querying Gemini Alexa/Echo bridge")
+                val geminiResult = interpretWithGemini(rawTranscript)
+                if (geminiResult != null && geminiResult.reply.isNotBlank()) {
+                    geminiResult
+                } else {
+                    Result(null, "Sorry, I didn't understand \"$rawTranscript\". Try asking for flashlight, alarms, calls, notifications, or general questions.")
+                }
             }
         }
-
-        if (result.action != null) {
-            val actionName = result.action.optString("action", "")
-            if (actionName.isNotBlank()) {
-                VoiceLearningStore.learn(transcript, actionName)
-            }
-        }
-
-        return result
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    private fun normalizeCommand(transcript: String): String {
+        var normalized = transcript
+            .lowercase()
+            .replace(Regex("[^a-z0-9:%$€£ ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        // Strip wake phrase prefixes
+        normalized = normalized
+            .replace(Regex("^(hey bro|hey bruh|hey brother|hello bro|ok bro|okay bro|hi bro)\\s+"), "")
+            .replace(Regex("^(please|kindly|can you|could you|would you|will you|i want to|i want you to|go ahead and|just)\\s+"), "")
+            .replace(Regex("\\b(the|a|an)\\b\\s+"), "")
+
+        // Phonetic homophones and typos
+        normalized = normalized
+            .replace(Regex("\\bflash\\s+light\\b"), "flashlight")
+            .replace(Regex("\\bwhat(?:'s|s)?\\s+app\\b"), "whatsapp")
+            .replace(Regex("\\b(?:you|u)\\s+tube\\b"), "youtube")
+            .replace(Regex("\\bwi(?:-|\\s+)fi\\b"), "wifi")
+            .replace(Regex("\\bblue(?:-|\\s+)tooth\\b"), "bluetooth")
+            .replace(Regex("\\bhot(?:-|\\s+)spot\\b"), "hotspot")
+            .replace(Regex("\\bcall\\s+to\\b"), "call")
+            .replace(Regex("\\btake\\s+a\\s+selfie\\b"), "take selfie")
+            .replace(Regex("\\btake\\s+a\\s+photo\\b"), "take photo")
+            .replace(Regex("\\btake\\s+a\\s+screenshot\\b"), "screenshot")
+            .replace(Regex("\\bturn\\s+on\\s+the\\b"), "turn on")
+            .replace(Regex("\\bturn\\s+off\\s+the\\b"), "turn off")
+            .replace(Regex("\\b(switch|put|set)\\s+(on)\\s+"), "turn on ")
+            .replace(Regex("\\b(switch|put|set)\\s+(off)\\s+"), "turn off ")
+            .replace(Regex("\\b(turn|switch|put)\\s+([a-z ]+?)\\s+(on|off)\\b"), "turn $3 $2")
+            .replace(Regex("\\b(enable|activate)\\s+"), "turn on ")
+            .replace(Regex("\\b(disable|deactivate)\\s+"), "turn off ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+        return normalized
+    }
+
+    private fun extractCallTargetAndSim(t: String): Pair<String, Int?> {
+        val triggers = listOf("call ", "dial ", "phone ")
+        var rawTarget = t
+        for (trigger in triggers) {
+            val idx = t.indexOf(trigger)
+            if (idx >= 0) {
+                rawTarget = t.substring(idx + trigger.length).trim()
+                break
+            }
+        }
+
+        var simSlot: Int? = null
+        if (rawTarget.contains("sim 1") || rawTarget.contains("sim one")) {
+            simSlot = 1
+        } else if (rawTarget.contains("sim 2") || rawTarget.contains("sim two")) {
+            simSlot = 2
+        }
+
+        val cleaned = rawTarget
+            .replace(Regex("""\b(from|using|on|with)\s+sim\s*(1|2|one|two)\b"""), "")
+            .replace(Regex("""\bsim\s*(1|2|one|two)\b"""), "")
+            .trim()
+
+        return Pair(if (cleaned.isNotBlank()) cleaned else rawTarget, simSlot)
+    }
+
+    private fun extractReplyContactAndMessage(t: String): Pair<String, String> {
+        val sayingIdx = when {
+            t.contains(" saying ") -> t.indexOf(" saying ")
+            t.contains(" that ") -> t.indexOf(" that ")
+            else -> -1
+        }
+
+        val message = if (sayingIdx >= 0) {
+            val keyword = if (t.contains(" saying ")) " saying " else " that "
+            t.substring(sayingIdx + keyword.length).trim()
+        } else {
+            t.removePrefix("reply to ")
+             .removePrefix("reply saying ")
+             .removePrefix("reply that ")
+             .removePrefix("reply ")
+             .trim()
+        }
+
+        val contactOrApp = if (sayingIdx >= 0 && t.startsWith("reply to ")) {
+            t.substring("reply to ".length, sayingIdx).trim()
+        } else if (t.startsWith("reply to ")) {
+            t.removePrefix("reply to ").trim()
+        } else {
+            ""
+        }
+
+        return Pair(contactOrApp, message)
+    }
+
+    private fun extractTime(t: String): Pair<Int, Int> {
+        val r12 = Regex("(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)")
+        val m12 = r12.find(t)
+        if (m12 != null) {
+            var h = m12.groupValues[1].toInt()
+            val m = m12.groupValues[2].toIntOrNull() ?: 0
+            val ampm = m12.groupValues[3]
+            if (ampm == "pm" && h < 12) h += 12
+            if (ampm == "am" && h == 12) h = 0
+            return Pair(h, m)
+        }
+
+        val r24 = Regex("(\\d{1,2}):(\\d{2})")
+        val m24 = r24.find(t)
+        if (m24 != null) {
+            return Pair(m24.groupValues[1].toInt(), m24.groupValues[2].toInt())
+        }
+
+        val rSimple = Regex("(?:at|for)\\s*(\\d{1,2})\\s*(?:o'?clock)?")
+        val mSimple = rSimple.find(t)
+        if (mSimple != null) {
+            val h = mSimple.groupValues[1].toInt()
+            return Pair(if (h <= 12) (h + 12).coerceAtMost(23) else h, 0)
+        }
+
+        return Pair(7, 0)
+    }
+
+    private fun extractAlarmLabel(t: String): String {
+        val markers = listOf("named ", "called ", "label ")
+        for (marker in markers) {
+            val idx = t.indexOf(marker)
+            if (idx >= 0) {
+                return t.substring(idx + marker.length).trim()
+            }
+        }
+        return "Wake up"
+    }
+
+    private fun extractDurationSeconds(t: String): Int {
+        val r = Regex("(?:for|in)?\\s*(\\d+)\\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)")
+        val matches = r.findAll(t)
+        var totalSec = 0
+        for (m in matches) {
+            val count = m.groupValues[1].toIntOrNull() ?: 0
+            val unit = m.groupValues[2].lowercase()
+            totalSec += when {
+                unit.startsWith("hour") || unit.startsWith("hr") -> count * 3600
+                unit.startsWith("minute") || unit.startsWith("min") -> count * 60
+                else -> count
+            }
+        }
+        return if (totalSec > 0) totalSec else 30
+    }
+
+    private fun formatDuration(seconds: Int): String {
+        val totalMinutes = seconds / 60
+        val remainingSeconds = seconds % 60
+        val totalHours = totalMinutes / 60
+        val remainingMinutes = totalMinutes % 60
+        return when {
+            totalHours > 0 -> "${totalHours}h ${remainingMinutes}m ${remainingSeconds}s"
+            totalMinutes > 0 -> "${totalMinutes}m ${remainingSeconds}s"
+            else -> "${seconds}s"
+        }
+    }
+
+    private fun formatTime(h: Int, m: Int): String {
+        val ampm = if (h < 12) "AM" else "PM"
+        val h12  = when {
+            h == 0   -> 12
+            h > 12   -> h - 12
+            else     -> h
+        }
+        return if (m == 0) "$h12 $ampm" else "$h12:%02d $ampm".format(m)
+    }
+
+    private fun extractDelay(t: String): Int {
+        val r = Regex("(?:in|after)\\s*(\\d+)\\s*sec")
+        val match = r.find(t)
+        return match?.groupValues?.get(1)?.toIntOrNull() ?: 0
+    }
+
+    private fun extractAppName(t: String): String {
+        val markers = listOf("open ", "launch ", "start ")
+        for (m in markers) {
+            val idx = t.indexOf(m)
+            if (idx >= 0) {
+                return t.substring(idx + m.length).trim()
+            }
+        }
+        return t
+    }
+
+    private fun extractContactAndMessage(t: String): Pair<String, String> {
+        val markers = listOf(" saying ", " that ")
+        for (m in markers) {
+            val idx = t.indexOf(m)
+            if (idx >= 0) {
+                val prefix = t.substring(0, idx)
+                val msg = t.substring(idx + m.length).trim()
+                val contact = prefix
+                    .replace(Regex("^(send whatsapp to|whatsapp to|send message to|message to|send sms to|send text to)\\s+"), "")
+                    .trim()
+                return Pair(contact, msg)
+            }
+        }
+        val clean = t
+            .replace(Regex("^(send whatsapp to|whatsapp to|send message to|message to|send sms to|send text to)\\s+"), "")
+            .trim()
+        return Pair(clean, "")
+    }
+
+    private fun extractSearchQuery(t: String): String {
+        val markers = listOf("search for ", "search ", "google ", "look up ")
+        for (m in markers) {
+            val idx = t.indexOf(m)
+            if (idx >= 0) {
+                return t.substring(idx + m.length).trim()
+            }
+        }
+        return t
+    }
+
+    private fun extractLocationQuery(t: String): String {
+        val markers = listOf("navigate to ", "directions to ", "maps to ", "open maps")
+        for (marker in markers) {
+            val idx = t.indexOf(marker)
+            if (idx >= 0) {
+                return t.substring(idx + marker.length).trim()
+            }
+        }
+        return t
+    }
+
+    private fun extractMediaQuery(t: String, app: String): String {
+        val markers = listOf("on $app", "$app", "play ")
+        var q = t
+        for (m in markers) q = q.replace(m, "")
+        return q.trim()
+    }
+
+    private fun getBatteryPercentage(): Int {
+        val bm = appContext?.getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+        return bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+    }
+
     private fun actionResultFromName(actionName: String): Result {
         return when (actionName) {
             "flashlightOn" -> Result(action("flashlightOn"), "Turning on flashlight")
             "flashlightOff" -> Result(action("flashlightOff"), "Turning off flashlight")
-            "toggleWifi" -> Result(action("toggleWifi", "enabled" to "true"), "Turning on WiFi")
+            "toggleWifi" -> Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
             "toggleBluetooth" -> Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
             "toggleAirplaneMode" -> Result(action("toggleAirplaneMode", "enabled" to "true"), "Turning on Airplane mode")
             "setAlarm" -> Result(action("setAlarm", "hour" to 7, "minute" to 0, "message" to "Wake up"), "Alarm set for 7:00")
@@ -355,148 +689,10 @@ object LocalCommandProcessor {
 
     private fun String.containsAny(vararg tokens: String) = tokens.any { this.contains(it) }
 
-    private fun String.matchesSend(platform: String) =
-        (this.contains("send") || this.contains("message")) && this.contains(platform)
-
-    private fun extractAppName(t: String): String =
-        t.removePrefix("open ").removePrefix("launch ").trim()
-         .replaceFirstChar { it.uppercaseChar() }
-
-    private fun extractSearchQuery(t: String): String {
-        val triggers = listOf("search for ", "search ", "google ", "look up ", "find ")
-        for (trigger in triggers) {
-            val idx = t.indexOf(trigger)
-            if (idx >= 0) return t.substring(idx + trigger.length).trim()
-        }
-        return t
-    }
-
-    private fun extractMediaQuery(t: String, app: String): String {
-        val markers = listOf("on $app", "$app ", "play ")
-        var q = t
-        for (m in markers) q = q.replace(m, "")
-        return q.trim()
-    }
-
-    private fun extractCallTarget(t: String): String {
-        val triggers = listOf("call ", "dial ", "phone ")
-        for (trigger in triggers) {
-            val idx = t.indexOf(trigger)
-            if (idx >= 0) return t.substring(idx + trigger.length).trim()
-        }
-        return t
-    }
-
-    private fun extractDurationSeconds(t: String): Int {
-        val r = Regex("(?:for|in)\\s*(\\d+)\\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)")
-        val match = r.find(t)
-        if (match != null) {
-            val value = match.groupValues[1].toInt()
-            val unit = match.groupValues[0].substringAfterLast(" ").lowercase()
-            return when {
-                unit.startsWith("minute") -> value * 60
-                unit.startsWith("hour") -> value * 60 * 60
-                else -> value
-            }
-        }
-        val quick = Regex("(\\d+)\\s*(?:seconds?|secs?)").find(t)
-        return quick?.groupValues?.get(1)?.toIntOrNull() ?: 30
-    }
-
-    private fun formatDuration(seconds: Int): String {
-        val totalMinutes = seconds / 60
-        val remainingSeconds = seconds % 60
-        val totalHours = totalMinutes / 60
-        val remainingMinutes = totalMinutes % 60
-        return when {
-            totalHours > 0 -> "${totalHours}h ${remainingMinutes}m ${remainingSeconds}s"
-            totalMinutes > 0 -> "${totalMinutes}m ${remainingSeconds}s"
-            else -> "${seconds}s"
-        }
-    }
-
-    private fun extractLocationQuery(t: String): String {
-        val markers = listOf("navigate to ", "directions to ", "maps to ", "open maps")
-        for (marker in markers) {
-            val idx = t.indexOf(marker)
-            if (idx >= 0) {
-                val query = t.substring(idx + marker.length).trim()
-                if (query.isNotBlank()) return query
-            }
-        }
-        return ""
-    }
-
-    private fun extractContactAndMessage(t: String): Pair<String, String> {
-        // "send a message to John saying hello there"
-        // "message John on whatsapp hello"
-        val toIdx   = t.indexOf(" to ")
-        val sayIdx  = t.lastIndexOf(" saying ")
-        val contact = when {
-            toIdx >= 0 && sayIdx > toIdx -> t.substring(toIdx + 4, sayIdx).trim()
-            toIdx >= 0                   -> t.substring(toIdx + 4).trim()
-            else                         -> ""
-        }
-        val message = if (sayIdx >= 0) t.substring(sayIdx + 8).trim() else ""
-        return contact to message
-    }
-
-    /**
-     * Extracts "at X o'clock" / "at H:MM" / "at H am/pm" patterns.
-     * Returns 24-hour (hour, minute).
-     */
-    private fun extractTime(t: String): Pair<Int, Int> {
-        // Pattern: "at 7:30", "at 7 30", "at 7:30 am", "at 7:30 pm"
-        val r1 = Regex("""at (\d{1,2})[: ](\d{2})\s*(am|pm)?""")
-        r1.find(t)?.let { m ->
-            var h = m.groupValues[1].toInt()
-            val min = m.groupValues[2].toInt()
-            val ampm = m.groupValues[3]
-            if (ampm == "pm" && h < 12) h += 12
-            if (ampm == "am" && h == 12) h = 0
-            return h to min
-        }
-        // Pattern: "at 7 am", "at 7 pm", "at 7 o'clock"
-        val r2 = Regex("""at (\d{1,2})\s*(am|pm|o'clock)?""")
-        r2.find(t)?.let { m ->
-            var h = m.groupValues[1].toInt()
-            val ampm = m.groupValues[2]
-            if (ampm == "pm" && h < 12) h += 12
-            if (ampm == "am" && h == 12) h = 0
-            return h to 0
-        }
-        return 7 to 0 // sensible default
-    }
-
-    private fun extractAlarmLabel(t: String): String {
-        val r = Regex("""(for|label|named?)\s+(.+)$""")
-        return r.find(t)?.groupValues?.get(2)?.trim() ?: ""
-    }
-
-    /** Extracts "after X seconds / in X seconds / X seconds" */
-    private fun extractDelay(t: String): Int {
-        val r = Regex("""(\d+)\s+second""")
-        return r.find(t)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-    }
-
-    private fun formatTime(h: Int, m: Int): String {
-        val suffix = if (h < 12) "AM" else "PM"
-        val h12    = when {
-            h == 0  -> 12
-            h > 12  -> h - 12
-            else    -> h
-        }
-        return "$h12:${m.toString().padStart(2, '0')} $suffix"
-    }
-
     private val jokes = listOf(
         "Why don't scientists trust atoms? Because they make up everything!",
-        "I told my phone I needed a break. Now it won't stop sending me notifications about it.",
-        "Why did the smartphone go to school? To improve its app-titude!",
-        "Why do programmers prefer dark mode? Because light attracts bugs.",
-        "What do you call a fish without eyes? A fsh!",
-        "Why did the computer go to the doctor? It had a virus and kept crashing!",
-        "I'm reading a book about anti-gravity. It's impossible to put down.",
-        "Why was the math book sad? Because it had too many problems."
+        "Why did the computer go to the doctor? Because it had a virus!",
+        "What do you call a fake noodle? An impasta!",
+        "Why did the scarecrow win an award? Because he was outstanding in his field!"
     )
 }

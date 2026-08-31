@@ -7,14 +7,10 @@ class WakeWordManager(context: Context, picovoiceKey: String) {
 
     private val TAG = "WakeWordManager"
 
-    // Prefer a phrase-based wake detector that listens only for the user's actual wake phrase,
-    // then falls back to local model-based options. This prevents any random ambient noise from
-    // activating the assistant.
+    // Only the phrase recognizer is allowed to wake the assistant. Generic audio
+    // threshold/model fallbacks can react to music, speech, or other devices.
     private val engines: List<IWakeWordEngine> = listOf(
-        SimpleAudioWakeTrigger(context),
-        HeyBroPhraseWakeEngine(context),
-        PicovoiceEngine(context, picovoiceKey),
-        OpenWakeWordEngine(context)
+        HeyBroPhraseWakeEngine(context)
     )
 
     var activeEngine: IWakeWordEngine? = null

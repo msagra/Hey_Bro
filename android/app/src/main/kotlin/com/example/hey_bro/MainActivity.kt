@@ -146,6 +146,15 @@ class MainActivity : FlutterActivity() {
                         CoreVoiceService.updateBackendWs(url)
                         result.success(true)
                     }
+                    "setGeminiApiKey" -> {
+                        val key = call.argument<String>("apiKey") ?: ""
+                        settingsPrefs.edit().putString("gemini_api_key", key.trim()).apply()
+                        CoreVoiceService.updateBackendWs("")
+                        result.success(true)
+                    }
+                    "getGeminiApiKey" -> {
+                        result.success(settingsPrefs.getString("gemini_api_key", ""))
+                    }
                     "setSttDelays" -> {
                         val map = call.arguments as? Map<String, Any?>
                         val ack = (map?.get("ackMs") as? Number)?.toLong() ?: 250L

@@ -9,6 +9,17 @@ object VoiceLearningStore {
     private const val PREF_NAME = "hey_bro_learning"
     private const val ALIAS_KEY = "custom_aliases"
     private var prefs: android.content.SharedPreferences? = null
+    private val supportedActions = setOf(
+        "openApp", "openCamera", "takePhoto", "takeSelfie", "setAlarm", "setTimer",
+        "makeCall", "sendWhatsApp", "searchWeb", "openMaps", "playMedia", "screenshot",
+        "scrollDown", "scrollUp", "volumeUp", "volumeDown", "mute", "flashlightOn",
+        "flashlightOff", "toggleWifi", "toggleBluetooth", "toggleAirplaneMode",
+        "toggleHotspot", "adjustBrightness", "openSettings", "lockScreen", "notifications",
+        "quickSettings", "recents", "mediaPlayPause", "mediaNext", "mediaPrevious",
+        "batterySaver", "doNotDisturb", "autoRotate", "createCalendarEvent", "sendSms",
+        "doubleTap", "longPress", "swipeLeft", "swipeRight", "globalBack", "globalHome",
+        "sleep"
+    )
 
     fun initialize(context: Context) {
         prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
@@ -16,7 +27,7 @@ object VoiceLearningStore {
 
     fun learn(transcript: String, action: String) {
         val normalized = normalize(transcript)
-        if (normalized.isBlank() || action.isBlank()) return
+        if (normalized.isBlank() || action !in supportedActions) return
         val current = loadMap().toMutableMap()
         current[normalized] = action
         prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current).toString())?.apply()
@@ -28,11 +39,19 @@ object VoiceLearningStore {
         if (normalized.isBlank()) return null
         val mapping = loadMap()
         for ((alias, action) in mapping) {
-            if (normalized == alias || normalized.contains(alias) || alias.contains(normalized)) {
+            if (normalized == alias || normalized.contains(alias) || alias.contains(normalized) ||
+                tokenSimilarity(normalized, alias) >= 0.82f) {
                 return action
             }
         }
         return null
+    }
+
+    private fun tokenSimilarity(left: String, right: String): Float {
+        val a = left.split(' ').filter { it.length > 1 }.toSet()
+        val b = right.split(' ').filter { it.length > 1 }.toSet()
+        if (a.isEmpty() || b.isEmpty()) return 0f
+        return (a.intersect(b).size.toFloat() / maxOf(a.size, b.size).toFloat())
     }
 
     private fun loadMap(): Map<String, String> {

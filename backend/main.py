@@ -385,7 +385,10 @@ def _build_spoken_text(action: str, args: dict) -> str:
         case "playMedia":      return f"Playing {args.get('query', 'that')} on {args.get('app', 'your app')}."
         case "takePhoto":      return "Taking a photo."
         case "globalAction":   return "Going back." if args.get("target") == "back" else "Going home."
-        case "makeCall":       return "Calling now."
+        case "makeCall":
+            sim = args.get("simSlot")
+            return f"Calling now from SIM {sim}." if sim else "Calling now."
+        case "replyNotification": return f"Replying: {args.get('message', 'message sent')}."
         case "click":          return "Tapping that."
         case "setText":        return "Typing that."
         case "screenshot":     return "Screenshot taken."
@@ -406,6 +409,8 @@ def _map_function_call(name: str, args: dict):
         return "openApp", args
     if name == "send_whatsapp_message":
         return "sendWhatsApp", args
+    if name == "reply_notification":
+        return "replyNotification", args
     if name == "control_hardware":
         return "controlHardware", args
     if name == "set_alarm":
@@ -434,16 +439,16 @@ def _run_gemini(contents: list, config) -> object:
 
 VALID_ACTIONS = {
     "openApp", "sendWhatsApp", "controlHardware", "setAlarm", "setTimer",
-    "searchWeb", "playMedia", "takePhoto", "globalAction", "makeCall",
+    "searchWeb", "playMedia", "takePhoto", "globalAction", "makeCall", "replyNotification",
     "click", "setText", "screenshot",
 }
 
 DECISION_SYSTEM_PROMPT = (
-    "You are Hey Bro — a fast, razor-sharp, loyal, and natural AI assistant living on the user's Android phone.\n"
+    "You are Hey Bro — a fast, razor-sharp, loyal, and natural AI assistant living on the user's Android phone like Alexa / Echo.\n"
     "Given the user's request, respond with ONLY a single JSON object and no other text.\n"
     "Personality Guidelines:\n"
     "- Tone: Grounded, authentic, witty, warm, and direct. Like a tech-savvy best friend who always has your back.\n"
-    "- Delivery: Keep conversational spoken replies strictly under 2 sentences unless complex information is explicitly requested.\n"
+    "- Delivery: Keep conversational spoken replies strictly under 2 sentences (under 25 words) unless complex information is explicitly requested.\n"
     "- Conversational Cadence: NEVER use robotic fillers like 'As an AI...', 'Sure thing!', 'I have processed your request', or 'Certainly!'. Jump straight to the point or acknowledgment.\n"
     "- Action Execution: When calling tools, keep the `reply` natural, punchy, and confident (e.g., instead of 'I will now proceed to open WhatsApp', use 'Opening WhatsApp.' or 'On it.').\n"
     "- Contextual Awareness: Track pronouns and previous entities across turns.\n"
@@ -452,16 +457,17 @@ DECISION_SYSTEM_PROMPT = (
     '{"type":"ACTION","action":"<action>","params":{...},"reply":"<short confirmation>"} \n'
     "If the user wants multiple actions performed sequentially, output exactly: "
     '{"type":"MULTI_ACTION","actions":[{"action":"<action>","params":{...}}, ...],"reply":"<short confirmation>"} \n'
-    "where action must be one of: openApp, sendWhatsApp, controlHardware, setAlarm, setTimer, "
+    "where action must be one of: openApp, sendWhatsApp, replyNotification, controlHardware, setAlarm, setTimer, "
     "searchWeb, playMedia, takePhoto, globalAction, makeCall, click, setText, screenshot. \n"
     "Param shapes: openApp -> {\"appName\":\"WhatsApp\"}; "
     "sendWhatsApp -> {\"contact\":\"Mom\",\"message\":\"hi\"}; "
+    "replyNotification -> {\"message\":\"on my way\",\"contact\":\"John\",\"packageName\":\"com.whatsapp\"}; "
     "controlHardware -> {\"device\":\"volume\",\"state\":\"up\"} or {\"device\":\"flashlight\",\"state\":\"on\"}; "
     "setAlarm -> {\"hour\":7,\"minute\":0}; setTimer -> {\"seconds\":60}; "
     "searchWeb -> {\"query\":\"best pizza\"}; playMedia -> {\"query\":\"song\",\"app\":\"YouTube\"}; "
     "takePhoto -> {\"delaySeconds\":0}; globalAction -> {\"target\":\"home\"} or {\"target\":\"back\"}; "
-    "makeCall -> {\"number\":\"...\"}. "
-    "For general questions, output: {\"type\":\"CONVERSATION\",\"reply\":\"<short answer>\"}. \n"
+    "makeCall -> {\"number\":\"...\",\"simSlot\":1}. "
+    "For general questions, facts, calculations, stories, or conversational chit-chat, output: {\"type\":\"CONVERSATION\",\"reply\":\"<short answer>\"}. \n"
     "Never refuse a task; always attempt it. "
     "Valid devices for controlHardware: flashlight, volume, wifi, bluetooth, airplane, brightness. "
     "Valid states for controlHardware: on, off, up, down, mute, increase, decrease, toggle."
@@ -599,7 +605,7 @@ async def _groq_llm_decision(transcript: str, history: list, tts_manager=None) -
     content = ""
     try:
         response_stream = await groq_async_client.chat.completions.create(
-            model="groq/compound",
+            model="llama-3.3-70b-versatile",
             messages=messages,
             temperature=0.0,
             max_tokens=350,
@@ -757,9 +763,9 @@ async def chat_endpoint(payload: dict):
     messages.append({"role": "user", "content": message})
 
     if provider == "groq" and groq_async_client:
-        selected_model = model or "openai/gpt-oss-120b"
-        if selected_model == "llama-3.3-70b-versatile" or selected_model == "groq/compound":
-            selected_model = "openai/gpt-oss-120b"
+        selected_model = model or "llama-3.3-70b-versatile"
+        if selected_model == "openai/gpt-oss-120b" or selected_model == "groq/compound":
+            selected_model = "llama-3.3-70b-versatile"
         try:
             response = await groq_async_client.chat.completions.create(
                 model=selected_model, messages=messages, temperature=0.4, max_tokens=800

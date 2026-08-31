@@ -6,7 +6,7 @@ import kotlin.math.abs
 
 class SimpleAudioWakeTrigger(private val context: Context) : IWakeWordEngine {
     private var triggered = false
-    private val threshold = 2600.0f
+    private val threshold = 1500.0f
     private val minBurstMs = 900L
     private var lastPeak = 0f
     private var burstStartMs = 0L

@@ -6,9 +6,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.util.Locale
 
 class GeminiIntentBridge(private val context: Context) {
+    private val supportedActions = setOf(
+        "openApp", "openCamera", "takePhoto", "takeSelfie", "setAlarm", "setTimer",
+        "makeCall", "replyNotification", "sendWhatsApp", "searchWeb", "openMaps", "playMedia", "screenshot",
+        "scrollDown", "scrollUp", "volumeUp", "volumeDown", "mute", "flashlightOn",
+        "flashlightOff", "toggleWifi", "toggleBluetooth", "toggleAirplaneMode",
+        "toggleHotspot", "adjustBrightness", "openSettings", "lockScreen", "notifications",
+        "quickSettings", "recents", "mediaPlayPause", "mediaNext", "mediaPrevious",
+        "batterySaver", "doNotDisturb", "autoRotate", "createCalendarEvent", "sendSms",
+        "doubleTap", "longPress", "swipeLeft", "swipeRight", "globalBack", "globalHome",
+        "sleep"
+    )
     private val prefs by lazy {
         context.getSharedPreferences("hey_bro_settings", Context.MODE_PRIVATE)
     }
@@ -19,14 +29,23 @@ class GeminiIntentBridge(private val context: Context) {
 
         return try {
             val requestBody = JSONObject().apply {
+                val systemInstruction = "You are 'Hey Bro', an intelligent voice assistant like Alexa / Amazon Echo. " +
+                    "Respond with a single JSON object with keys: \"action\" (string), \"params\" (object), and \"reply\" (string). " +
+                    "For device operations, action must be one of: openApp, openCamera, takePhoto, takeSelfie, setAlarm, setTimer, makeCall, replyNotification, sendWhatsApp, searchWeb, openMaps, playMedia, screenshot, scrollDown, scrollUp, volumeUp, volumeDown, mute, flashlightOn, flashlightOff, toggleWifi, toggleBluetooth, toggleAirplaneMode, toggleHotspot, adjustBrightness, openSettings, lockScreen, notifications, quickSettings, recents, mediaPlayPause, mediaNext, mediaPrevious, batterySaver, doNotDisturb, autoRotate, createCalendarEvent, sendSms, globalBack, globalHome, sleep. " +
+                    "For makeCall, params can include \"number\" and optional \"simSlot\" (1 or 2). " +
+                    "For replyNotification, params must include \"message\" and optional \"contact\" / \"packageName\". " +
+                    "For all general questions, facts, calculations, stories, or chit-chat, set \"action\" to \"none\" with \"params\": {} and provide a concise, direct, natural spoken answer strictly under 20 words in \"reply\". NEVER use Markdown formatting, bullet points, or lists."
+                
                 put("contents", JSONArray().put(
-                    JSONObject().put("parts", JSONArray().put(
-                        JSONObject().put("text", transcript)
-                    ))
+                    JSONObject().put("parts", JSONArray()
+                        .put(JSONObject().put("text", systemInstruction))
+                        .put(JSONObject().put("text", transcript))
+                    )
                 ))
                 put("generationConfig", JSONObject().apply {
                     put("temperature", 0.1)
-                    put("maxOutputTokens", 256)
+                    put("maxOutputTokens", 200)
+                    put("responseMimeType", "application/json")
                 })
             }
 
@@ -34,8 +53,8 @@ class GeminiIntentBridge(private val context: Context) {
             val connection = url.openConnection() as HttpURLConnection
             connection.requestMethod = "POST"
             connection.doOutput = true
-            connection.connectTimeout = 12_000
-            connection.readTimeout = 12_000
+            connection.connectTimeout = 6_000
+            connection.readTimeout = 6_000
             connection.setRequestProperty("Content-Type", "application/json")
             connection.setRequestProperty("Accept", "application/json")
 
@@ -69,19 +88,29 @@ class GeminiIntentBridge(private val context: Context) {
 
             if (modelText.isBlank()) return null
             val jsonObject = extractJsonObject(modelText) ?: return null
-            val action = jsonObject.optString("action", "")
-            val params = jsonObject.optJSONObject("params") ?: JSONObject()
-            val reply = jsonObject.optString("reply", jsonObject.optString("response", "Done."))
+            val action = jsonObject.optString("action", "").trim()
+            var reply = jsonObject.optString("reply", jsonObject.optString("response", "Done.")).trim()
+            // Clean up any stray markdown
+            reply = reply.replace(Regex("[*#_`~]"), "").replace(Regex("\\s+"), " ").trim()
 
+            if (action.isBlank() || action == "none" || action !in supportedActions) {
+                return if (reply.isNotBlank()) {
+                    LocalCommandProcessor.Result(null, reply)
+                } else {
+                    null
+                }
+            }
+
+            val params = jsonObject.optJSONObject("params") ?: JSONObject()
             val actionJson = JSONObject().apply {
                 put("action", action)
                 params.keys().forEach { key ->
                     put(key, params.get(key))
                 }
             }
-            LocalCommandProcessor.Result(actionJson, reply)
+            LocalCommandProcessor.Result(actionJson, if (reply.isNotBlank()) reply else "Done.")
         } catch (e: Exception) {
-            Log.w("GeminiIntentBridge", "Gemini fallback failed", e)
+            Log.w("GeminiIntentBridge", "Gemini reasoning failed: ${e.message}")
             null
         }
     }
