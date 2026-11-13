@@ -96,7 +96,7 @@ class DashboardScreen extends StatefulWidget {
 }
 
 class _DashboardScreenState extends State<DashboardScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WidgetsBindingObserver {
 
   static const _platform     = MethodChannel('com.example.hey_bro/assistant');
   static const _eventChannel = EventChannel('com.example.hey_bro/events');
@@ -152,9 +152,11 @@ class _DashboardScreenState extends State<DashboardScreen>
     _waveCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1800));
 
     _checkPermissions();
+    WidgetsBinding.instance.addObserver(this);
     _permissionTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkPermissions());
     _loadBackendConfig();
     _loadHistoryFromDb();
+    _syncAliasesToNative();
     _checkLaunchIntent();
 
     _eventSub = _eventChannel.receiveBroadcastStream().listen(
@@ -177,11 +179,19 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
     _permissionTimer?.cancel();
     _eventSub?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkPermissions();
+    }
   }
 
   Future<void> _checkLaunchIntent() async {
@@ -304,7 +314,7 @@ class _DashboardScreenState extends State<DashboardScreen>
 
       if (res is Map) {
         final perms = Map<String, dynamic>.from(res);
-        final newHasMic = perms['mic'] == true;
+        final newHasMic = perms['mic'] == true || perms['microphone'] == true;
         final newHasCamera = perms['camera'] == true;
         final newHasA11y = perms['accessibility'] == true;
         final newHasOverlay = perms['overlay'] == true;
@@ -394,7 +404,7 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   Future<void> _loadBackendConfig() async {
     try {
-      final url = await _platform.invokeMethod('getBackendWs') as String? ?? _geminiLiveWs;
+      final url = await _safeInvoke<String>('getBackendWs') ?? _geminiLiveWs;
       if (mounted) setState(() => _backendWs = url);
     } catch (e) {
       debugPrint('getBackendWs error: $e');
@@ -448,62 +458,127 @@ class _DashboardScreenState extends State<DashboardScreen>
     }
   }
 
-  Future<void> _openApiKeyDialog() async {
-    String currentKey = '';
+  Future<T?> _safeInvoke<T>(String method, [dynamic arguments]) async {
     try {
-      currentKey = await _platform.invokeMethod<String>('getGeminiApiKey') ?? '';
+      return await _platform.invokeMethod<T>(method, arguments);
+    } catch (e) {
+      debugPrint('Platform invoke "$method" error: $e');
+      return null;
+    }
+  }
+
+  Future<void> _syncAliasesToNative() async {
+    try {
+      final list = await DatabaseHelper.instance.getAliases();
+      final mapped = list.map((item) => {
+        'phrase': (item['trigger_phrase'] as String?) ?? '',
+        'action': (item['target_value'] as String?) ?? '',
+      }).toList();
+      await _safeInvoke('syncCustomAliases', {'aliases': mapped});
+    } catch (e) {
+      debugPrint('Error syncing aliases to native: $e');
+    }
+  }
+
+  Future<void> _openApiKeyDialog() async {
+    String currentGeminiKey = '';
+    String currentGroqKey = '';
+    try {
+      currentGeminiKey = await _safeInvoke<String>('getGeminiApiKey') ?? '';
+      currentGroqKey = await _safeInvoke<String>('getGroqApiKey') ?? '';
     } catch (_) {}
 
-    if (currentKey.trim().isEmpty) {
+    if (currentGeminiKey.trim().isEmpty) {
       final envKey = dotenv.env['GEMINI_API_KEY'] ?? '';
       if (envKey.trim().isNotEmpty && !envKey.contains('your_gemini')) {
-        currentKey = envKey;
+        currentGeminiKey = envKey;
+      }
+    }
+    if (currentGroqKey.trim().isEmpty) {
+      final envKey = dotenv.env['GROQ_API_KEY'] ?? '';
+      if (envKey.trim().isNotEmpty && !envKey.contains('your_groq')) {
+        currentGroqKey = envKey;
       }
     }
 
     if (!mounted) return;
-    final ctrl = TextEditingController(text: currentKey);
+    final geminiCtrl = TextEditingController(text: currentGeminiKey);
+    final groqCtrl = TextEditingController(text: currentGroqKey);
 
     await showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF141520),
-        title: const Text('Gemini API Key', style: TextStyle(color: Colors.white)),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              'Configured for Gemini 3.8 Live WebSocket and offline REST fallback.',
-              style: TextStyle(color: Colors.white60, fontSize: 13),
-            ),
-            const SizedBox(height: 14),
-            TextField(
-              controller: ctrl,
-              obscureText: true,
-              style: const TextStyle(color: Colors.white, fontSize: 13),
-              decoration: InputDecoration(
-                filled: true,
-                fillColor: Colors.white.withValues(alpha: 0.08),
-                hintText: 'Enter your Gemini API key',
-                hintStyle: const TextStyle(color: Colors.white24),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+        title: const Text('API & Cloud Fallback Keys', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                '1. Google Gemini (Primary Voice Engine)',
+                style: TextStyle(color: Color(0xFF00E5CC), fontSize: 13, fontWeight: FontWeight.bold),
               ),
-            ),
-          ],
+              const SizedBox(height: 4),
+              const Text(
+                'Live bidirectional audio (gemini-3.8-live) + zero-server REST fallback.',
+                style: TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: geminiCtrl,
+                obscureText: true,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: InputDecoration(
+                  filled: true,
+                  fillColor: Colors.white.withValues(alpha: 0.08),
+                  hintText: 'Enter your Gemini API key',
+                  hintStyle: const TextStyle(color: Colors.white24),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                ),
+              ),
+              const SizedBox(height: 18),
+              const Text(
+                '2. Groq Cloud (Ultra-Fast Edge Fallback)',
+                style: TextStyle(color: Color(0xFFFF9500), fontSize: 13, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 4),
+              const Text(
+                'Direct edge reasoning (<200ms) with Llama 3.3 70B & 3.1 8B when Gemini has network jitter.',
+                style: TextStyle(color: Colors.white54, fontSize: 11),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: groqCtrl,
+                obscureText: true,
+                style: const TextStyle(color: Colors.white, fontSize: 13),
+                decoration: InputDecoration(
+                  filled: true,
+                  fillColor: Colors.white.withValues(alpha: 0.08),
+                  hintText: 'Enter your Groq API key',
+                  hintStyle: const TextStyle(color: Colors.white24),
+                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                ),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
           FilledButton(
             onPressed: () async {
-              final newKey = ctrl.text.trim();
-              if (newKey.isNotEmpty) {
-                await _platform.invokeMethod('setGeminiApiKey', {'apiKey': newKey});
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Gemini API key updated')),
-                  );
-                }
+              final newGemini = geminiCtrl.text.trim();
+              final newGroq = groqCtrl.text.trim();
+              if (newGemini.isNotEmpty) {
+                await _safeInvoke('setGeminiApiKey', {'apiKey': newGemini});
+              }
+              if (newGroq.isNotEmpty) {
+                await _safeInvoke('setGroqApiKey', {'apiKey': newGroq});
+              }
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('API Keys and Groq configuration updated')),
+                );
               }
               if (ctx.mounted) Navigator.pop(ctx);
             },
@@ -516,17 +591,71 @@ class _DashboardScreenState extends State<DashboardScreen>
 
   Future<void> _openAliasesDialog() async {
     final aliases = await DatabaseHelper.instance.getAliases();
+    debugPrint('IN _openAliasesDialog: mounted=$mounted, aliases=${aliases.length}');
     if (!mounted) return;
 
     final phraseCtrl = TextEditingController();
     final actionCtrl = TextEditingController();
+    String? selectedAction;
+
+    const commonPresets = [
+      {'label': '🔦 Torch On', 'phrase': 'turn on torch', 'action': 'flashlightOn'},
+      {'label': '🔦 Torch Off', 'phrase': 'turn off torch', 'action': 'flashlightOff'},
+      {'label': '🤳 Selfie', 'phrase': 'take a selfie', 'action': 'takeSelfie'},
+      {'label': '📸 Screenshot', 'phrase': 'take screenshot', 'action': 'screenshot'},
+      {'label': '🔇 Mute', 'phrase': 'silence phone', 'action': 'mute'},
+      {'label': '🔊 Vol Up', 'phrase': 'volume up', 'action': 'volumeUp'},
+      {'label': '🔉 Vol Down', 'phrase': 'volume down', 'action': 'volumeDown'},
+      {'label': '💬 WhatsApp', 'phrase': 'open whatsapp', 'action': 'openApp:com.whatsapp'},
+      {'label': '▶️ YouTube', 'phrase': 'open youtube', 'action': 'openApp:com.google.android.youtube'},
+      {'label': '📶 WiFi', 'phrase': 'turn on wifi', 'action': 'toggleWifi'},
+      {'label': '📡 Bluetooth', 'phrase': 'turn on bluetooth', 'action': 'toggleBluetooth'},
+      {'label': '🔒 Lock Screen', 'phrase': 'lock screen', 'action': 'lockScreen'},
+      {'label': '🌙 DND', 'phrase': 'do not disturb', 'action': 'doNotDisturb'},
+      {'label': '🔋 Battery Saver', 'phrase': 'battery saver', 'action': 'batterySaver'},
+      {'label': '🗺️ Maps', 'phrase': 'open maps', 'action': 'openMaps'},
+    ];
+
+    const actionOptions = {
+      'Turn On Flashlight': 'flashlightOn',
+      'Turn Off Flashlight': 'flashlightOff',
+      'Take Selfie': 'takeSelfie',
+      'Take Photo': 'takePhoto',
+      'Open Camera': 'openCamera',
+      'Take Screenshot': 'screenshot',
+      'Mute / Silence Phone': 'mute',
+      'Volume Up': 'volumeUp',
+      'Volume Down': 'volumeDown',
+      'Play / Pause Music': 'mediaPlayPause',
+      'Next Track': 'mediaNext',
+      'Previous Track': 'mediaPrevious',
+      'Toggle Wi-Fi': 'toggleWifi',
+      'Toggle Bluetooth': 'toggleBluetooth',
+      'Toggle Hotspot': 'toggleHotspot',
+      'Toggle Airplane Mode': 'toggleAirplaneMode',
+      'Lock Screen': 'lockScreen',
+      'Battery Saver': 'batterySaver',
+      'Do Not Disturb': 'doNotDisturb',
+      'Show Notifications': 'notifications',
+      'Quick Settings': 'quickSettings',
+      'Recent Apps': 'recents',
+      'Go Home': 'globalHome',
+      'Go Back': 'globalBack',
+      'Open WhatsApp': 'openApp:com.whatsapp',
+      'Open YouTube': 'openApp:com.google.android.youtube',
+      'Open Spotify': 'openApp:com.spotify.music',
+      'Open Google Maps': 'openMaps',
+      'Open Settings': 'openSettings',
+    };
 
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
       backgroundColor: const Color(0xFF12131D),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
-      builder: (ctx) => StatefulBuilder(
+      builder: (ctx) {
+        debugPrint('BUILDING BOTTOM SHEET CONTENT');
+        return StatefulBuilder(
         builder: (ctx, setModalState) => Padding(
           padding: EdgeInsets.only(
             left: 20, right: 20, top: 20,
@@ -543,8 +672,36 @@ class _DashboardScreenState extends State<DashboardScreen>
                   IconButton(icon: const Icon(Icons.close, color: Colors.white54), onPressed: () => Navigator.pop(ctx)),
                 ],
               ),
-              const Text('Add local voice shortcuts executed in <50ms without network', style: TextStyle(color: Colors.white54, fontSize: 12)),
+              const Text('Add local voice shortcuts executed in <50ms without network round-trip', style: TextStyle(color: Colors.white54, fontSize: 12)),
               const SizedBox(height: 12),
+
+              // Quick Preset Chips
+              SizedBox(
+                height: 36,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: commonPresets.length,
+                  separatorBuilder: (_, i) => const SizedBox(width: 8),
+                  itemBuilder: (_, idx) {
+                    final p = commonPresets[idx];
+                    return ActionChip(
+                      label: Text(p['label']!, style: const TextStyle(fontSize: 11, color: Colors.white)),
+                      backgroundColor: Colors.white.withValues(alpha: 0.08),
+                      side: BorderSide.none,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      onPressed: () {
+                        setModalState(() {
+                          phraseCtrl.text = p['phrase']!;
+                          actionCtrl.text = p['action']!;
+                          selectedAction = p['action'];
+                        });
+                      },
+                    );
+                  },
+                ),
+              ),
+              const SizedBox(height: 12),
+
               Row(
                 children: [
                   Expanded(
@@ -562,16 +719,30 @@ class _DashboardScreenState extends State<DashboardScreen>
                   ),
                   const SizedBox(width: 8),
                   Expanded(
-                    child: TextField(
-                      controller: actionCtrl,
+                    child: DropdownButtonFormField<String>(
+                      initialValue: selectedAction,
+                      dropdownColor: const Color(0xFF1B1C2A),
+                      isExpanded: true,
                       style: const TextStyle(color: Colors.white, fontSize: 13),
                       decoration: InputDecoration(
-                        hintText: "Action ('flashlightOn')",
+                        hintText: 'Select action',
                         hintStyle: const TextStyle(color: Colors.white30),
                         filled: true,
                         fillColor: Colors.white.withValues(alpha: 0.06),
                         border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
                       ),
+                      items: actionOptions.entries.map((e) => DropdownMenuItem(
+                        value: e.value,
+                        child: Text(e.key, style: const TextStyle(fontSize: 12), overflow: TextOverflow.ellipsis),
+                      )).toList(),
+                      onChanged: (val) {
+                        if (val != null) {
+                          setModalState(() {
+                            selectedAction = val;
+                            actionCtrl.text = val;
+                          });
+                        }
+                      },
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -579,12 +750,15 @@ class _DashboardScreenState extends State<DashboardScreen>
                     icon: const Icon(Icons.add),
                     onPressed: () async {
                       final p = phraseCtrl.text.trim();
-                      final a = actionCtrl.text.trim();
-                      if (p.isNotEmpty && a.isNotEmpty) {
+                      final a = actionCtrl.text.trim().isNotEmpty ? actionCtrl.text.trim() : selectedAction;
+                      if (p.isNotEmpty && a != null && a.isNotEmpty) {
                         await DatabaseHelper.instance.insertAlias(p, 'action', a);
-                        await _platform.invokeMethod('addCustomAlias', {'phrase': p, 'action': a});
+                        await _safeInvoke('addCustomAlias', {'phrase': p, 'action': a});
                         phraseCtrl.clear();
                         actionCtrl.clear();
+                        setModalState(() {
+                          selectedAction = null;
+                        });
                         final updated = await DatabaseHelper.instance.getAliases();
                         setModalState(() {
                           aliases.clear();
@@ -596,10 +770,23 @@ class _DashboardScreenState extends State<DashboardScreen>
                 ],
               ),
               const SizedBox(height: 16),
-              const Text('Active Shortcuts:', style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Active Shortcuts (${aliases.length}):', style: const TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
+                  TextButton.icon(
+                    icon: const Icon(Icons.sync_rounded, size: 14),
+                    label: const Text('Sync Native', style: TextStyle(fontSize: 11)),
+                    onPressed: () async {
+                      await _syncAliasesToNative();
+                      if (mounted) _showSnack('Synchronized ${aliases.length} shortcuts with native engine');
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
               ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 180),
+                constraints: const BoxConstraints(maxHeight: 220),
                 child: ListView.builder(
                   shrinkWrap: true,
                   itemCount: aliases.length,
@@ -629,9 +816,10 @@ class _DashboardScreenState extends State<DashboardScreen>
             ],
           ),
         ),
-      ),
-    );
-  }
+      );
+    },
+  );
+}
 
   void _showSnack(String msg) {
     if (!mounted) return;
@@ -762,11 +950,11 @@ class _DashboardScreenState extends State<DashboardScreen>
                   const _SectionHeader(title: 'Permissions', icon: Icons.security_rounded),
                   const SizedBox(height: 10),
 
-                  _PermTile(title: 'Microphone', icon: Icons.mic_rounded, granted: _hasMic, onFix: () => _platform.invokeMethod('requestMicPermission')),
-                  _PermTile(title: 'Accessibility Service', icon: Icons.accessibility_new_rounded, granted: _hasA11y, onFix: () => _platform.invokeMethod('openAccessibilitySettings')),
-                  _PermTile(title: 'Draw Over Other Apps', icon: Icons.layers_rounded, granted: _hasOverlay, onFix: () => _platform.invokeMethod('requestOverlayPermission')),
-                  _PermTile(title: 'Notifications Access', icon: Icons.notifications_rounded, granted: _hasNotificationAccess, onFix: () => _platform.invokeMethod('openNotificationListenerSettings')),
-                  _PermTile(title: 'Battery Optimization', icon: Icons.battery_charging_full_rounded, granted: _hasBattery, onFix: () => _platform.invokeMethod('requestBatteryExemption')),
+                  _PermTile(title: 'Microphone', icon: Icons.mic_rounded, granted: _hasMic, onFix: () => _safeInvoke('requestMicPermission')),
+                  _PermTile(title: 'Accessibility Service', icon: Icons.accessibility_new_rounded, granted: _hasA11y, onFix: () => _safeInvoke('openAccessibilitySettings')),
+                  _PermTile(title: 'Draw Over Other Apps', icon: Icons.layers_rounded, granted: _hasOverlay, onFix: () => _safeInvoke('requestOverlayPermission')),
+                  _PermTile(title: 'Notifications Access', icon: Icons.notifications_rounded, granted: _hasNotificationAccess, onFix: () => _safeInvoke('openNotificationListenerSettings')),
+                  _PermTile(title: 'Battery Optimization', icon: Icons.battery_charging_full_rounded, granted: _hasBattery, onFix: () => _safeInvoke('requestBatteryExemption')),
 
                   const SizedBox(height: 40),
                 ]),

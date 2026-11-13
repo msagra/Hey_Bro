@@ -18,16 +18,27 @@ object LocalCommandProcessor {
 
     private const val TAG = "LocalCommandProcessor"
     private var geminiBridge: GeminiIntentBridge? = null
+    private var groqBridge: GroqIntentBridge? = null
     private var appContext: Context? = null
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
         VoiceLearningStore.initialize(context)
         geminiBridge = GeminiIntentBridge(context)
+        groqBridge = GroqIntentBridge(context)
     }
 
     fun interpretWithGemini(transcript: String): Result? {
-        return geminiBridge?.interpret(transcript)
+        val geminiResult = geminiBridge?.interpret(transcript)
+        if (geminiResult != null) return geminiResult
+
+        // Seamless zero-latency fallback to Groq (Llama 3.3 70B / Llama 3.1 8B)
+        Log.i(TAG, "Gemini REST unavailable or failed; executing Groq edge fallback...")
+        return groqBridge?.interpret(transcript)
+    }
+
+    fun interpretWithGroq(transcript: String): Result? {
+        return groqBridge?.interpret(transcript)
     }
 
     data class Result(
@@ -702,16 +713,51 @@ object LocalCommandProcessor {
     }
 
     private fun actionResultFromName(actionName: String): Result {
+        if (actionName.startsWith("openApp:")) {
+            val pkg = actionName.removePrefix("openApp:").trim()
+            val friendly = when {
+                pkg.contains("whatsapp", ignoreCase = true) -> "WhatsApp"
+                pkg.contains("youtube", ignoreCase = true) -> "YouTube"
+                pkg.contains("spotify", ignoreCase = true) -> "Spotify"
+                pkg.contains("chrome", ignoreCase = true) -> "Chrome"
+                pkg.contains("map", ignoreCase = true) -> "Maps"
+                else -> pkg.substringAfterLast('.')
+            }
+            return Result(action("openApp", "packageName" to pkg, "appName" to friendly), "Opening $friendly")
+        }
+
         return when (actionName) {
-            "flashlightOn" -> Result(action("flashlightOn"), "Turning on flashlight")
-            "flashlightOff" -> Result(action("flashlightOff"), "Turning off flashlight")
-            "toggleWifi" -> Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
-            "toggleBluetooth" -> Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
-            "toggleAirplaneMode" -> Result(action("toggleAirplaneMode", "enabled" to "true"), "Turning on Airplane mode")
-            "setAlarm" -> Result(action("setAlarm", "hour" to 7, "minute" to 0, "message" to "Wake up"), "Alarm set for 7:00")
-            "makeCall" -> Result(action("makeCall", "number" to ""), "Calling")
-            "openApp" -> Result(action("openApp", "appName" to "Main app"), "Opening app")
-            "playMedia" -> Result(action("playMedia", "query" to "", "app" to "YouTube"), "Playing media")
+            "flashlightOn"       -> Result(action("flashlightOn"), "Turning on flashlight")
+            "flashlightOff"      -> Result(action("flashlightOff"), "Turning off flashlight")
+            "mute"               -> Result(action("mute"), "Muting audio")
+            "volumeUp"           -> Result(action("volumeUp"), "Increasing volume")
+            "volumeDown"         -> Result(action("volumeDown"), "Decreasing volume")
+            "takeSelfie"         -> Result(action("takeSelfie"), "Opening front camera")
+            "takePhoto"          -> Result(action("takePhoto"), "Opening camera")
+            "openCamera"         -> Result(action("openCamera"), "Opening camera")
+            "screenshot"         -> Result(action("screenshot"), "Taking screenshot")
+            "lockScreen"         -> Result(action("lockScreen"), "Locking screen")
+            "batterySaver"       -> Result(action("batterySaver"), "Toggling battery saver")
+            "doNotDisturb"       -> Result(action("doNotDisturb"), "Toggling Do Not Disturb")
+            "notifications"      -> Result(action("notifications"), "Showing notifications")
+            "quickSettings"      -> Result(action("quickSettings"), "Opening quick settings")
+            "recents"            -> Result(action("recents"), "Opening recent apps")
+            "globalBack"         -> Result(action("globalBack"), "Going back")
+            "globalHome"         -> Result(action("globalHome"), "Going home")
+            "mediaPlayPause"     -> Result(action("mediaPlayPause"), "Toggling playback")
+            "mediaNext"          -> Result(action("mediaNext"), "Skipping track")
+            "mediaPrevious"      -> Result(action("mediaPrevious"), "Previous track")
+            "toggleWifi"         -> Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
+            "toggleBluetooth"    -> Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
+            "toggleAirplaneMode" -> Result(action("toggleAirplaneMode", "enabled" to "true"), "Toggling Airplane mode")
+            "toggleHotspot"      -> Result(action("toggleHotspot", "enabled" to "true"), "Toggling hotspot")
+            "openSettings"       -> Result(action("openSettings"), "Opening Settings")
+            "openMaps"           -> Result(action("openMaps"), "Opening Maps")
+            "setAlarm"           -> Result(action("setAlarm", "hour" to 7, "minute" to 0, "message" to "Wake up"), "Alarm set for 7:00")
+            "setTimer"           -> Result(action("setTimer", "seconds" to 300, "message" to "Timer"), "Timer set for 5 minutes")
+            "makeCall"           -> Result(action("makeCall", "number" to ""), "Opening phone dialer")
+            "openApp"            -> Result(action("openApp", "appName" to "App"), "Opening app")
+            "playMedia"          -> Result(action("playMedia", "query" to "", "app" to "YouTube"), "Playing media")
             else -> Result(null, "I’m ready to help.")
         }
     }

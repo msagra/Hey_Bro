@@ -37,6 +37,7 @@ class MainActivity : FlutterActivity() {
         private const val KEY_BACKEND_WS   = "backend_ws"
         private const val DEFAULT_BACKEND_WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         val DEFAULT_GEMINI_KEY: String get() = BuildConfig.GEMINI_API_KEY
+        val DEFAULT_GROQ_KEY: String get() = BuildConfig.GROQ_API_KEY
         private const val SETTINGS_PREFS = "hey_bro_settings"
     }
 
@@ -158,11 +159,11 @@ class MainActivity : FlutterActivity() {
                         requestCommunicationPermissions()
                         result.success(true)
                     }
-                    "requestNotificationAccess" -> {
+                    "requestNotificationAccess", "openNotificationListenerSettings" -> {
                         startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                         result.success(true)
                     }
-                    "requestAccessibilityPermission" -> {
+                    "requestAccessibilityPermission", "openAccessibilitySettings" -> {
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
                         result.success(true)
                     }
@@ -205,12 +206,37 @@ class MainActivity : FlutterActivity() {
                         val key = settingsPrefs.getString("gemini_api_key", "")?.trim() ?: ""
                         result.success(if (key.isNotBlank()) key else DEFAULT_GEMINI_KEY)
                     }
+                    "setGroqApiKey" -> {
+                        val key = call.argument<String>("apiKey") ?: ""
+                        settingsPrefs.edit().putString("groq_api_key", key.trim()).apply()
+                        result.success(true)
+                    }
+                    "getGroqApiKey" -> {
+                        val key = settingsPrefs.getString("groq_api_key", "")?.trim() ?: ""
+                        result.success(if (key.isNotBlank()) key else DEFAULT_GROQ_KEY)
+                    }
                     "addCustomAlias" -> {
                         val phrase = call.argument<String>("phrase") ?: ""
                         val action = call.argument<String>("action") ?: ""
                         if (phrase.isNotBlank() && action.isNotBlank()) {
                             VoiceLearningStore.initialize(applicationContext)
                             VoiceLearningStore.learn(phrase, action)
+                        }
+                        result.success(true)
+                    }
+                    "syncCustomAliases" -> {
+                        val list = call.argument<List<Map<String, String>>>("aliases")
+                        if (list != null) {
+                            VoiceLearningStore.initialize(applicationContext)
+                            val map = mutableMapOf<String, String>()
+                            for (item in list) {
+                                val p = item["phrase"] ?: item["trigger_phrase"] ?: ""
+                                val a = item["action"] ?: item["target_value"] ?: ""
+                                if (p.isNotBlank() && a.isNotBlank()) {
+                                    map[p] = a
+                                }
+                            }
+                            VoiceLearningStore.learnBatch(map)
                         }
                         result.success(true)
                     }
@@ -292,18 +318,19 @@ class MainActivity : FlutterActivity() {
         val notificationAccess = isNotificationAccessEnabled()
 
         return mapOf(
+            "mic"           to mic,
             "microphone"    to mic,
             "camera"        to camera,
             "overlay"       to overlay,
             "accessibility" to a11y,
             "battery"       to battery,
-            "notification"  to notification
-            ,"phone"         to call
-            ,"callLog"       to readCallLog
-            ,"contacts"      to contacts
-            ,"readSms"       to readSms
-            ,"sendSms"       to sendSms
-            ,"notificationAccess" to notificationAccess
+            "notification"  to notification,
+            "phone"         to call,
+            "callLog"       to readCallLog,
+            "contacts"      to contacts,
+            "readSms"       to readSms,
+            "sendSms"       to sendSms,
+            "notificationAccess" to notificationAccess
         )
     }
 

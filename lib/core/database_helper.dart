@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
@@ -9,12 +10,60 @@ class DatabaseHelper {
   static final DatabaseHelper instance = DatabaseHelper._();
 
   static Database? _database;
+  static Completer<Database>? _dbInitCompleter;
 
   Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDatabase();
-    return _database!;
+    if (_database != null && _database!.isOpen) return _database!;
+    if (_dbInitCompleter != null) return _dbInitCompleter!.future;
+
+    final completer = Completer<Database>();
+    _dbInitCompleter = completer;
+    try {
+      _database = await _initDatabase();
+      completer.complete(_database!);
+      return _database!;
+    } catch (e) {
+      completer.completeError(e);
+      rethrow;
+    } finally {
+      _dbInitCompleter = null;
+    }
   }
+
+  static const List<Map<String, String>> defaultShortcuts = [
+    {'trigger_phrase': 'torch', 'target_type': 'action', 'target_value': 'flashlightOn'},
+    {'trigger_phrase': 'turn on flashlight', 'target_type': 'action', 'target_value': 'flashlightOn'},
+    {'trigger_phrase': 'turn off flashlight', 'target_type': 'action', 'target_value': 'flashlightOff'},
+    {'trigger_phrase': 'torch off', 'target_type': 'action', 'target_value': 'flashlightOff'},
+    {'trigger_phrase': 'silence phone', 'target_type': 'action', 'target_value': 'mute'},
+    {'trigger_phrase': 'mute', 'target_type': 'action', 'target_value': 'mute'},
+    {'trigger_phrase': 'volume up', 'target_type': 'action', 'target_value': 'volumeUp'},
+    {'trigger_phrase': 'volume down', 'target_type': 'action', 'target_value': 'volumeDown'},
+    {'trigger_phrase': 'take a selfie', 'target_type': 'action', 'target_value': 'takeSelfie'},
+    {'trigger_phrase': 'front camera', 'target_type': 'action', 'target_value': 'takeSelfie'},
+    {'trigger_phrase': 'take photo', 'target_type': 'action', 'target_value': 'takePhoto'},
+    {'trigger_phrase': 'open camera', 'target_type': 'action', 'target_value': 'openCamera'},
+    {'trigger_phrase': 'screenshot', 'target_type': 'action', 'target_value': 'screenshot'},
+    {'trigger_phrase': 'take screenshot', 'target_type': 'action', 'target_value': 'screenshot'},
+    {'trigger_phrase': 'lock screen', 'target_type': 'action', 'target_value': 'lockScreen'},
+    {'trigger_phrase': 'battery saver', 'target_type': 'action', 'target_value': 'batterySaver'},
+    {'trigger_phrase': 'do not disturb', 'target_type': 'action', 'target_value': 'doNotDisturb'},
+    {'trigger_phrase': 'show notifications', 'target_type': 'action', 'target_value': 'notifications'},
+    {'trigger_phrase': 'quick settings', 'target_type': 'action', 'target_value': 'quickSettings'},
+    {'trigger_phrase': 'recent apps', 'target_type': 'action', 'target_value': 'recents'},
+    {'trigger_phrase': 'go home', 'target_type': 'action', 'target_value': 'globalHome'},
+    {'trigger_phrase': 'go back', 'target_type': 'action', 'target_value': 'globalBack'},
+    {'trigger_phrase': 'pause music', 'target_type': 'action', 'target_value': 'mediaPlayPause'},
+    {'trigger_phrase': 'next song', 'target_type': 'action', 'target_value': 'mediaNext'},
+    {'trigger_phrase': 'previous song', 'target_type': 'action', 'target_value': 'mediaPrevious'},
+    {'trigger_phrase': 'turn on wifi', 'target_type': 'action', 'target_value': 'toggleWifi'},
+    {'trigger_phrase': 'turn on bluetooth', 'target_type': 'action', 'target_value': 'toggleBluetooth'},
+    {'trigger_phrase': 'turn on hotspot', 'target_type': 'action', 'target_value': 'toggleHotspot'},
+    {'trigger_phrase': 'open maps', 'target_type': 'action', 'target_value': 'openMaps'},
+    {'trigger_phrase': 'open whatsapp', 'target_type': 'action', 'target_value': 'openApp:com.whatsapp'},
+    {'trigger_phrase': 'open youtube', 'target_type': 'action', 'target_value': 'openApp:com.google.android.youtube'},
+    {'trigger_phrase': 'open spotify', 'target_type': 'action', 'target_value': 'openApp:com.spotify.music'},
+  ];
 
   Future<Database> _initDatabase() async {
     final dbPath = await getDatabasesPath();
@@ -24,6 +73,9 @@ class DatabaseHelper {
       path,
       version: _dbVersion,
       onCreate: _onCreate,
+      onOpen: (db) async {
+        await _ensureDefaultShortcuts(db);
+      },
     );
   }
 
@@ -60,17 +112,17 @@ class DatabaseHelper {
       )
     ''');
 
-    // Pre-populate sensible default aliases
-    await db.insert('custom_aliases', {
-      'trigger_phrase': 'torch',
-      'target_type': 'action',
-      'target_value': 'flashlightOn',
-    });
-    await db.insert('custom_aliases', {
-      'trigger_phrase': 'silence phone',
-      'target_type': 'action',
-      'target_value': 'mute',
-    });
+    await _ensureDefaultShortcuts(db);
+  }
+
+  Future<void> _ensureDefaultShortcuts(Database db) async {
+    for (final shortcut in defaultShortcuts) {
+      await db.insert(
+        'custom_aliases',
+        shortcut,
+        conflictAlgorithm: ConflictAlgorithm.ignore,
+      );
+    }
   }
 
   // ── Conversation APIs ────────────────────────────────────────────────────────

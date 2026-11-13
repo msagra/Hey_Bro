@@ -23,15 +23,69 @@ object VoiceLearningStore {
 
     fun initialize(context: Context) {
         prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        seedDefaultsIfEmpty()
+    }
+
+    private fun seedDefaultsIfEmpty() {
+        if (loadMap().isNotEmpty()) return
+        val defaults = mapOf(
+            "torch" to "flashlightOn",
+            "turn on flashlight" to "flashlightOn",
+            "turn off flashlight" to "flashlightOff",
+            "torch off" to "flashlightOff",
+            "silence phone" to "mute",
+            "mute" to "mute",
+            "volume up" to "volumeUp",
+            "volume down" to "volumeDown",
+            "take a selfie" to "takeSelfie",
+            "front camera" to "takeSelfie",
+            "take photo" to "takePhoto",
+            "open camera" to "openCamera",
+            "screenshot" to "screenshot",
+            "take screenshot" to "screenshot",
+            "lock screen" to "lockScreen",
+            "battery saver" to "batterySaver",
+            "do not disturb" to "doNotDisturb",
+            "show notifications" to "notifications",
+            "quick settings" to "quickSettings",
+            "recent apps" to "recents",
+            "go home" to "globalHome",
+            "go back" to "globalBack",
+            "pause music" to "mediaPlayPause",
+            "next song" to "mediaNext",
+            "previous song" to "mediaPrevious",
+            "turn on wifi" to "toggleWifi",
+            "turn on bluetooth" to "toggleBluetooth",
+            "open maps" to "openMaps",
+            "open whatsapp" to "openApp:com.whatsapp",
+            "open youtube" to "openApp:com.google.android.youtube"
+        )
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(defaults).toString())?.apply()
+        Log.i(TAG, "Seeded ${defaults.size} default voice shortcuts into VoiceLearningStore")
     }
 
     fun learn(transcript: String, action: String) {
         val normalized = normalize(transcript)
-        if (normalized.isBlank() || action !in supportedActions) return
+        val baseAction = if (action.startsWith("openApp:")) "openApp" else action
+        if (normalized.isBlank() || baseAction !in supportedActions) return
         val current = loadMap().toMutableMap()
         current[normalized] = action
         prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current).toString())?.apply()
         Log.d(TAG, "Learned alias: '$normalized' -> '$action'")
+    }
+
+    fun learnBatch(entries: Map<String, String>) {
+        if (entries.isEmpty()) return
+        val current = loadMap().toMutableMap()
+        for ((phrase, action) in entries) {
+            val normalized = normalize(phrase)
+            val baseAction = if (action.startsWith("openApp:")) "openApp" else action
+            if (normalized.isNotBlank() && baseAction in supportedActions) {
+                current[normalized] = action
+            }
+        }
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current).toString())?.apply()
+        Log.d(TAG, "Learned batch of ${entries.size} aliases")
     }
 
     fun findActionForTranscript(transcript: String): String? {
