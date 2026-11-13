@@ -5,6 +5,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import okhttp3.OkHttpClient
@@ -15,6 +16,7 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -43,41 +45,122 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         private const val TAG = "AudioStreamer"
         private const val PLAYBACK_SAMPLE_RATE = 24000 // Gemini Live outputs 24kHz 16-bit PCM Linear Mono
         private const val MAX_RETRIES = 6
-        private val RETRY_DELAYS_MS = longArrayOf(1_000, 2_000, 3_000, 5_000, 8_000, 12_000)
-        private const val SETUP_HANDSHAKE_TIMEOUT_MS = 5_000L
+        private val RETRY_DELAYS_MS = longArrayOf(500, 1_000, 2_000, 4_000, 6_000, 10_000)
         private const val GEMINI_LIVE_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
+        const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
     }
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
     private var webSocket: WebSocket? = null
     private var wsUrl: String = ""
     private var apiKey: String = ""
+    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
     private val isConnected = AtomicBoolean(false)
+    private val isConnecting = AtomicBoolean(false)
     private val setupComplete = AtomicBoolean(false)
     private var isGeminiLive = true
+    private var powerManager: PowerManager? = null
+    private var lastAudioActivityMs = System.currentTimeMillis()
+
+    fun setPowerManager(pm: PowerManager?) {
+        this.powerManager = pm
+    }
+
+    private val idleCheckRunnable = object : Runnable {
+        override fun run() {
+            checkIdleTimeout()
+            mainHandler.postDelayed(this, 5000L)
+        }
+    }
+
+    private fun checkIdleTimeout() {
+        if (!isConnected.get()) return
+        val isScreenOn = powerManager?.isInteractive ?: true
+        val silenceDuration = System.currentTimeMillis() - lastAudioActivityMs
+
+        // If screen is off and we have 15 seconds of silence, close gracefully to save battery
+        if (!isScreenOn && silenceDuration > 15_000L) {
+            Log.i(TAG, "Screen off + 15s silence: gracefully closing Gemini WebSocket to preserve battery")
+            stopAll()
+        }
+    }
 
     fun isConnected(): Boolean = isConnected.get()
     private var retryCount = 0
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .writeTimeout(5, TimeUnit.SECONDS)
+        .connectTimeout(3, TimeUnit.SECONDS)
+        .writeTimeout(3, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(15, TimeUnit.SECONDS)
+        .pingInterval(20, TimeUnit.SECONDS) // 20-second keep-alive ping while warm
         .build()
 
     // ── AudioTrack (Live 24kHz playback) ──────────────────────────────────────
     private var audioTrack: AudioTrack? = null
+    private val audioTrackLock = Any()
     private val isTtsActive = AtomicBoolean(false)
+
+    // ── Dedicated audio writer thread ─────────────────────────────────────────
+    private val audioQueue = LinkedBlockingQueue<ByteArray>()
+    @Volatile private var audioWriterRunning = false
+    private var audioWriterThread: Thread? = null
+
+    private fun startAudioWriter() {
+        if (audioWriterRunning) return
+        audioWriterRunning = true
+        audioWriterThread = Thread({
+            while (audioWriterRunning) {
+                try {
+                    val data = audioQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    synchronized(audioTrackLock) {
+                        val track = audioTrack
+                        if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                            if (!isTtsActive.getAndSet(true)) {
+                                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                                    try { track.play() } catch (_: Throwable) {}
+                                }
+                            }
+                            try { track.write(data, 0, data.size) } catch (_: Throwable) {}
+                        }
+                    }
+                } catch (_: InterruptedException) {
+                    break
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Audio writer error: ${e.message}")
+                }
+            }
+        }, "AudioStreamer-Writer").apply {
+            priority = Thread.MAX_PRIORITY
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun stopAudioWriter() {
+        audioWriterRunning = false
+        audioWriterThread?.interrupt()
+        audioWriterThread = null
+        audioQueue.clear()
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  Public API
     // ─────────────────────────────────────────────────────────────────────────
 
+    fun prewarm(urlOrApiKey: String) {
+        if (isConnected.get() || isConnecting.get() || urlOrApiKey.isBlank()) return
+        Log.i(TAG, "Speculative pre-warm of Gemini Live WebSocket triggered on speech onset")
+        connect(urlOrApiKey)
+    }
+
     fun connect(urlOrApiKey: String) {
-        mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.removeCallbacks(idleCheckRunnable)
+        mainHandler.postDelayed(idleCheckRunnable, 5000L)
+        isConnecting.set(true)
+        lastAudioActivityMs = System.currentTimeMillis()
         isConnected.set(false)
         setupComplete.set(false)
         webSocket?.close(1000, "Backend changed")
@@ -94,11 +177,13 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
         retryCount = 0
         buildAudioTrack()
+        startAudioWriter()
         buildAndConnect()
     }
 
     fun sendAudioChunk(chunk: ByteArray) {
         if (!isConnected.get()) return
+        lastAudioActivityMs = System.currentTimeMillis()
 
         if (isGeminiLive) {
             try {
@@ -147,10 +232,14 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     fun flushAndPauseAudio() {
-        try {
-            audioTrack?.pause()
-            audioTrack?.flush()
-        } catch (_: Exception) {}
+        synchronized(audioTrackLock) {
+            try {
+                if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    audioTrack?.pause()
+                }
+                audioTrack?.flush()
+            } catch (_: Throwable) {}
+        }
         isTtsActive.set(false)
     }
 
@@ -160,10 +249,13 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
     fun stopAll() {
         isConnected.set(false)
+        isConnecting.set(false)
         setupComplete.set(false)
+        mainHandler.removeCallbacks(idleCheckRunnable)
         mainHandler.removeCallbacksAndMessages(null)
         webSocket?.close(1000, "Service stopped")
         webSocket = null
+        stopAudioWriter()
         stopAudioTrack()
         releaseAudioTrack()
     }
@@ -204,7 +296,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         try {
             val setupObj = JSONObject().apply {
                 put("setup", JSONObject().apply {
-                    put("model", "models/gemini-2.0-flash-exp")
+                    put("model", activeLiveModel)
                     put("generationConfig", JSONObject().apply {
                         put("responseModalities", JSONArray().put("AUDIO"))
                         put("speechConfig", JSONObject().apply {
@@ -217,7 +309,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                     })
                     put("systemInstruction", JSONObject().apply {
                         put("parts", JSONArray().put(JSONObject().apply {
-                            put("text", "You are Hey Bro, an ultra-fast, direct voice assistant. Keep all spoken replies natural and strictly under 15 words. When the user requests any device action (such as opening an app, placing a phone call, replying to a notification, sending a WhatsApp message, or adjusting hardware settings), invoke the corresponding tool function immediately.")
+                            put("text", "You are Hey Bro, an ultra-fast, direct, and attentive AI voice assistant. Listen carefully to user speech even when spoken quickly, softly, with diverse accents, or in noisy environments. When the user requests any device action (such as opening an app, placing a phone call, replying to a notification, sending a WhatsApp message, adjusting hardware settings, alarms, timers, media, or taking photos), invoke the corresponding tool function immediately. Keep all spoken replies natural, friendly, and strictly under 15 words.")
                         }))
                     })
                     put("tools", JSONArray().put(JSONObject().apply {
@@ -478,47 +570,68 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     // ── AudioTrack ────────────────────────────────────────────────────────────
 
     private fun buildAudioTrack() {
-        releaseAudioTrack()
-        val minBuf = AudioTrack.getMinBufferSize(
-            PLAYBACK_SAMPLE_RATE,
-            AudioFormat.CHANNEL_OUT_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(8192)
+        synchronized(audioTrackLock) {
+            releaseAudioTrackInternal()
+            val sampleRate = if (isGeminiLive) PLAYBACK_SAMPLE_RATE else 16000
+            val minBuf = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_MONO,
+                AudioFormat.ENCODING_PCM_16BIT
+            ).coerceAtLeast(8192)
+            // Use 6x buffer to prevent underruns during live audio streaming
 
-        audioTrack = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            try {
+                audioTrack = AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setAudioFormat(
+                        AudioFormat.Builder()
+                            .setSampleRate(sampleRate)
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                            .build()
+                    )
+                    .setBufferSizeInBytes(minBuf * 6)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
                     .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(PLAYBACK_SAMPLE_RATE)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .build()
-            )
-            .setBufferSizeInBytes(minBuf * 4)
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-        audioTrack?.pause()
+                audioTrack?.pause()
+            } catch (e: Throwable) {
+                Log.w(TAG, "Failed to build AudioTrack: ${e.message}")
+                audioTrack = null
+            }
+        }
     }
 
     private fun releaseAudioTrack() {
+        synchronized(audioTrackLock) {
+            releaseAudioTrackInternal()
+        }
+    }
+
+    private fun releaseAudioTrackInternal() {
         try {
-            audioTrack?.stop()
+            if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                audioTrack?.stop()
+            }
             audioTrack?.release()
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
         audioTrack = null
         isTtsActive.set(false)
     }
 
     private fun stopAudioTrack() {
-        try {
-            audioTrack?.pause()
-            audioTrack?.flush()
-        } catch (_: Exception) {}
+        synchronized(audioTrackLock) {
+            try {
+                if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    audioTrack?.pause()
+                }
+                audioTrack?.flush()
+            } catch (_: Throwable) {}
+        }
         isTtsActive.set(false)
     }
 
@@ -529,32 +642,17 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     private inner class SocketListener : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            Log.i(TAG, "WebSocket connected to Gemini Live ✓")
+            Log.i(TAG, "WebSocket connected successfully ✓")
             isConnected.set(true)
+            isConnecting.set(false)
             retryCount = 0
             listener.onConnectionStateChanged(true)
             sendSetupHandshake()
-            // Validate that the setup handshake completes within timeout
-            if (isGeminiLive) {
-                mainHandler.postDelayed({
-                    if (isConnected.get() && !setupComplete.get()) {
-                        Log.w(TAG, "Setup handshake not acknowledged within ${SETUP_HANDSHAKE_TIMEOUT_MS}ms; reconnecting")
-                        webSocket.close(1000, "Setup timeout")
-                        isConnected.set(false)
-                        listener.onConnectionStateChanged(false)
-                        scheduleReconnect()
-                    }
-                }, SETUP_HANDSHAKE_TIMEOUT_MS)
-            }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            // Raw binary audio fallback
-            val data = bytes.toByteArray()
-            if (!isTtsActive.getAndSet(true)) {
-                audioTrack?.play()
-            }
-            audioTrack?.write(data, 0, data.size)
+            // Raw binary audio fallback — route through dedicated writer thread
+            audioQueue.offer(bytes.toByteArray())
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -593,10 +691,8 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                                     val base64 = inlineData.optString("data", "")
                                     if (base64.isNotBlank()) {
                                         val pcmBytes = Base64.decode(base64, Base64.DEFAULT)
-                                        if (!isTtsActive.getAndSet(true)) {
-                                            audioTrack?.play()
-                                        }
-                                        audioTrack?.write(pcmBytes, 0, pcmBytes.size)
+                                        // Route through dedicated writer thread to avoid blocking WS reader
+                                        audioQueue.offer(pcmBytes)
                                         listener.onSpokenTextReceived("Speaking…")
                                     }
                                 }
@@ -660,14 +756,24 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.e(TAG, "Gemini Live WebSocket failure: ${t.message}")
+            if (activeLiveModel != FALLBACK_LIVE_MODEL) {
+                Log.w(TAG, "Attempting connection fallback from $activeLiveModel to $FALLBACK_LIVE_MODEL")
+                activeLiveModel = FALLBACK_LIVE_MODEL
+            }
             isConnected.set(false)
+            isConnecting.set(false)
             listener.onConnectionStateChanged(false)
             scheduleReconnect()
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.i(TAG, "Gemini Live WebSocket closed ($code): $reason")
+            if (code == 1008 && activeLiveModel != FALLBACK_LIVE_MODEL) {
+                Log.w(TAG, "Policy violation 1008; switching to fallback model: $FALLBACK_LIVE_MODEL")
+                activeLiveModel = FALLBACK_LIVE_MODEL
+            }
             isConnected.set(false)
+            isConnecting.set(false)
             listener.onConnectionStateChanged(false)
         }
     }
@@ -675,7 +781,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     private fun handleResponseComplete() {
         mainHandler.postDelayed({
             stopAudioTrack()
-        }, 500)
+        }, 250)
         listener.onResponseComplete()
     }
 }

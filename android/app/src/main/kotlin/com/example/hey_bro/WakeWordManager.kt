@@ -3,12 +3,11 @@ package com.example.hey_bro
 import android.content.Context
 import android.util.Log
 
-class WakeWordManager(context: Context, picovoiceKey: String) {
+class WakeWordManager(context: Context, picovoiceKey: String = "") {
 
     private val TAG = "WakeWordManager"
 
-    // Only the phrase recognizer is allowed to wake the assistant. Generic audio
-    // threshold/model fallbacks can react to music, speech, or other devices.
+    // Primary and only continuous wake phrase engine
     private val engines: List<IWakeWordEngine> = listOf(
         HeyBroPhraseWakeEngine(context)
     )
@@ -28,7 +27,7 @@ class WakeWordManager(context: Context, picovoiceKey: String) {
             }
         }
         
-        Log.e(TAG, "CRITICAL ERROR: All wake word engines failed to initialize!")
+        Log.e(TAG, "CRITICAL ERROR: Wake word engine failed to initialize!")
         return false
     }
 

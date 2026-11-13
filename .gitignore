@@ -44,5 +44,11 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Environment & Secrets
 .env
-backend/.env
+*.env
+*.env.local
+*.env.*.local
+local.properties
+*.jks
+*.keystore

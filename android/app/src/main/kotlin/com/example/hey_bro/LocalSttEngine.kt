@@ -43,7 +43,7 @@ class LocalSttEngine(private val context: Context) {
     // Watchdog to recover from stuck or extremely short listening sessions
     private var listenStartMs: Long = 0L
     // Increase listen window for noisy devices; allow longer capture before forcing timeout
-    private val MAX_LISTEN_MS = 20_000L
+    private val MAX_LISTEN_MS = 15_000L
     // If NO_MATCH occurs within this threshold consider it a "start too soon" and retry with backoff
     private val SHORT_START_THRESHOLD_MS = 1200L
     // Track whether this listening session was initiated after TTS to apply extra settling delay
@@ -190,12 +190,17 @@ class LocalSttEngine(private val context: Context) {
 
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+            val defaultLocale = java.util.Locale.getDefault().toLanguageTag()
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, if (defaultLocale.isNotBlank()) defaultLocale else "en-US")
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "en-US")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 250L)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, context.packageName)
+            putExtra("android.speech.extra.ENABLE_BIASING", true)
+            putExtra("android.speech.extra.DICTATION_MODE", true)
         }
 
         try {
@@ -245,7 +250,7 @@ class LocalSttEngine(private val context: Context) {
             if (error == 11 || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
                 if (internalRetryCount < 2) {
                     internalRetryCount++
-                    val delayMs = 600L * internalRetryCount
+                    val delayMs = 400L * internalRetryCount
                     Log.w(TAG, "Recoverable STT error ($error); rebuilding recognizer (retry $internalRetryCount/2 in ${delayMs}ms)")
                     mainHandler.postDelayed({
                         if (!isInitialized || destroyed) return@postDelayed
@@ -291,11 +296,23 @@ class LocalSttEngine(private val context: Context) {
             mainHandler.removeCallbacks(watchdogRunnable)
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val scores = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
+
+            val actionKeywords = listOf(
+                "flashlight", "torch", "camera", "photo", "selfie", "screenshot",
+                "call", "phone", "dial", "whatsapp", "message", "reply", "alarm",
+                "timer", "wifi", "bluetooth", "brightness", "volume", "battery",
+                "youtube", "spotify", "music", "song", "time", "date", "open", "search"
+            )
+
             val best = matches
                 ?.mapIndexed { index, value ->
                     val text = value.trim()
-                    val score = scores?.getOrNull(index) ?: 0.5f
-                    Triple(text, score, index)
+                    var score = scores?.getOrNull(index) ?: 0.5f
+                    if (score < 0f) score = 0.5f
+                    val lower = text.lowercase()
+                    val hasAction = actionKeywords.any { lower.contains(it) }
+                    val boostedScore = if (hasAction) score + 0.35f else score
+                    Triple(text, boostedScore, index)
                 }
                 ?.filter { it.first.isNotBlank() }
                 ?.maxWithOrNull(compareBy<Triple<String, Float, Int>> { it.second }.thenBy { it.first.length })

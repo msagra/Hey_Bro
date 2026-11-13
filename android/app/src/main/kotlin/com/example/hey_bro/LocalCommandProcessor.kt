@@ -36,6 +36,38 @@ object LocalCommandProcessor {
     )
 
     // ─────────────────────────────────────────────────────────────────────────
+    //  Parallel Local Fast-Path (<50ms deterministic execution)
+    // ─────────────────────────────────────────────────────────────────────────
+    fun checkFastPath(chunkTranscript: String): Result? {
+        val t = normalizeCommand(chunkTranscript)
+        if (t.isBlank()) return null
+
+        // 1. Check VoiceLearningStore / custom shortcuts
+        val learnedAction = VoiceLearningStore.findActionForTranscript(t)
+        if (learnedAction != null) {
+            Log.i(TAG, "Parallel fast-path matched custom shortcut: '$t' -> $learnedAction (<50ms)")
+            return actionResultFromName(learnedAction)
+        }
+
+        // 2. Check deterministic regex rules (flashlight, volume, alarm, timer, call)
+        val single = processSingle(t, chunkTranscript)
+        if (single.action != null) {
+            val act = single.action.optString("action")
+            if (act in setOf(
+                "flashlightOn", "flashlightOff",
+                "volumeUp", "volumeDown", "mute",
+                "setAlarm", "setTimer", "makeCall",
+                "openCamera", "takePhoto", "takeSelfie",
+                "screenshot", "globalBack", "globalHome"
+            )) {
+                Log.i(TAG, "Parallel fast-path matched deterministic hardware rule: $act (<50ms)")
+                return single
+            }
+        }
+        return null
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
     fun process(transcript: String): Result {
         val t = normalizeCommand(transcript)
         Log.d(TAG, "Processing normalized: \"$t\" (raw: \"$transcript\")")
@@ -195,32 +227,36 @@ object LocalCommandProcessor {
 
             t.containsAny(
                 "turn on flashlight", "flashlight on", "turn on torch", "torch on",
-                "turn on flash", "turn flash on", "turn on the flashlight", "flash on", "light on"
+                "turn on flash", "turn flash on", "turn on the flashlight", "flash on", "light on",
+                "turn on light", "torch", "flashlight", "open flashlight", "open torch",
+                "enable flashlight", "enable torch", "switch on flashlight", "switch on torch"
             ) ->
                 Result(action("flashlightOn"), "Turning on flashlight")
 
             t.containsAny(
                 "turn off flashlight", "flashlight off", "turn off torch", "torch off",
-                "turn off flash", "turn flash off", "turn off the flashlight", "flash off", "light off"
+                "turn off flash", "turn flash off", "turn off the flashlight", "flash off", "light off",
+                "turn off light", "disable flashlight", "disable torch", "stop torch", "close flashlight",
+                "switch off flashlight", "switch off torch", "shut off flashlight", "shut off torch"
             ) ->
                 Result(action("flashlightOff"), "Turning off flashlight")
 
-            t.containsAny("hotspot on", "turn on hotspot", "enable hotspot") ->
+            t.containsAny("hotspot on", "turn on hotspot", "enable hotspot", "start hotspot", "switch on hotspot") ->
                 Result(action("toggleHotspot", "enabled" to "true"), "Turning on hotspot")
 
-            t.containsAny("hotspot off", "turn off hotspot", "disable hotspot") ->
+            t.containsAny("hotspot off", "turn off hotspot", "disable hotspot", "stop hotspot", "switch off hotspot") ->
                 Result(action("toggleHotspot", "enabled" to "false"), "Turning off hotspot")
 
-            t.containsAny("wifi on", "turn on wifi", "enable wifi") ->
+            t.containsAny("wifi on", "turn on wifi", "enable wifi", "start wifi", "switch on wifi") ->
                 Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
 
-            t.containsAny("wifi off", "turn off wifi", "disable wifi") ->
+            t.containsAny("wifi off", "turn off wifi", "disable wifi", "stop wifi", "switch off wifi") ->
                 Result(action("toggleWifi", "enabled" to "false"), "Turning off Wi-Fi")
 
-            t.containsAny("bluetooth on", "turn on bluetooth", "enable bluetooth") ->
+            t.containsAny("bluetooth on", "turn on bluetooth", "enable bluetooth", "start bluetooth", "switch on bluetooth") ->
                 Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
 
-            t.containsAny("bluetooth off", "turn off bluetooth", "disable bluetooth") ->
+            t.containsAny("bluetooth off", "turn off bluetooth", "disable bluetooth", "stop bluetooth", "switch off bluetooth") ->
                 Result(action("toggleBluetooth", "enabled" to "false"), "Turning off Bluetooth")
 
             t.containsAny("airplane mode on", "turn on airplane", "enable airplane") ->
@@ -259,14 +295,13 @@ object LocalCommandProcessor {
             t.containsAny("lock screen", "lock phone", "lock device") ->
                 Result(action("lockScreen"), "Locking screen")
 
-            // ── Volume / Media ───────────────────────────────────────────────
-            t.containsAny("volume up", "increase volume", "raise volume", "louder") ->
+            t.containsAny("volume up", "increase volume", "raise volume", "louder", "sound up", "turn it up", "more volume", "higher volume") ->
                 Result(action("volumeUp"), "Increasing volume")
 
-            t.containsAny("volume down", "decrease volume", "lower volume", "softer", "reduce volume") ->
+            t.containsAny("volume down", "decrease volume", "lower volume", "softer", "reduce volume", "sound down", "turn it down", "less volume") ->
                 Result(action("volumeDown"), "Decreasing volume")
 
-            t.containsAny("mute", "silence phone", "mute volume") ->
+            t.containsAny("mute", "silence phone", "mute volume", "quiet", "silent") ->
                 Result(action("mute"), "Muting volume")
 
             t.containsAny("pause music", "pause video", "stop music", "resume music", "play pause", "pause media") ->
@@ -376,18 +411,18 @@ object LocalCommandProcessor {
                 Result(action("adjustBrightness", "direction" to "down"), "Decreasing brightness")
 
             // ── General / Social / Info ──────────────────────────────────────
-            t.containsAny("what is the time", "what time is it", "tell me time", "current time") -> {
+            t.containsAny("what is the time", "what time is it", "tell me time", "current time", "what's the time", "time please", "the time", "check time") -> {
                 val cal = Calendar.getInstance()
                 Result(null, "It is ${formatTime(cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE))}.")
             }
 
-            t.containsAny("what is the date", "today's date", "what day is it", "current date") -> {
+            t.containsAny("what is the date", "today's date", "what day is it", "current date", "what's the date", "today date") -> {
                 val cal = Calendar.getInstance()
                 val dateStr = "${cal.getDisplayName(Calendar.DAY_OF_WEEK, Calendar.LONG, java.util.Locale.getDefault())}, ${cal.getDisplayName(Calendar.MONTH, Calendar.LONG, java.util.Locale.getDefault())} ${cal.get(Calendar.DAY_OF_MONTH)}"
                 Result(null, "Today is $dateStr.")
             }
 
-            t.containsAny("battery level", "battery percentage", "how much battery") -> {
+            t.containsAny("battery level", "battery percentage", "how much battery", "check battery", "battery status", "phone battery", "my battery") -> {
                 val level = getBatteryPercentage()
                 Result(null, if (level >= 0) "Your battery is at $level percent." else "Battery information unavailable.")
             }
@@ -407,7 +442,7 @@ object LocalCommandProcessor {
             t.containsAny("tell me a joke", "say a joke", "joke") ->
                 Result(null, jokes.random())
 
-            t.containsAny("stop listening", "go to sleep", "goodbye", "bye bro", "sleep") ->
+            t.containsAny("stop listening", "go to sleep", "goodbye", "bye bro", "sleep", "shut up", "cancel", "nevermind") ->
                 Result(action("sleep"), "Going to sleep. Say Hey Bro to wake me up.")
 
             else -> {
@@ -435,8 +470,8 @@ object LocalCommandProcessor {
 
         // Strip wake phrase prefixes
         normalized = normalized
-            .replace(Regex("^(hey bro|hey bruh|hey brother|hello bro|ok bro|okay bro|hi bro)\\s+"), "")
-            .replace(Regex("^(please|kindly|can you|could you|would you|will you|i want to|i want you to|go ahead and|just)\\s+"), "")
+            .replace(Regex("^(hey bro|hey broo|hey broh|hay bro|he bro|hey bruh|hey brother|hello bro|ok bro|okay bro|hi bro|yo bro|oye bro|ay bro|ey bro|bro)\\s+"), "")
+            .replace(Regex("^(can you please|could you please|please|kindly|can you|could you|would you|will you|i want to|i want you to|go ahead and|just|hey|listen)\\s+"), "")
             .replace(Regex("\\b(the|a|an)\\b\\s+"), "")
 
         // Phonetic homophones and typos

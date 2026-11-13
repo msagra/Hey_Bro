@@ -9,8 +9,10 @@ import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.WindowManager
 import android.view.accessibility.AccessibilityManager
 import androidx.annotation.NonNull
 import androidx.core.app.ActivityCompat
@@ -31,19 +33,58 @@ class MainActivity : FlutterActivity() {
     private val COMMUNICATION_PERMISSION_CODE = 1004
 
     companion object {
+        var activeActivity: MainActivity? = null
         private const val KEY_BACKEND_WS   = "backend_ws"
-        private const val DEFAULT_BACKEND_WS = "wss://hey-bro-1zxk.onrender.com/ws/audio"
+        private const val DEFAULT_BACKEND_WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        val DEFAULT_GEMINI_KEY: String get() = BuildConfig.GEMINI_API_KEY
         private const val SETTINGS_PREFS = "hey_bro_settings"
     }
 
     private lateinit var bootPrefs: SharedPreferences
     private lateinit var settingsPrefs: SharedPreferences
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        activeActivity = this
+
+        // OriginOS 6 & Android 15: show over lockscreen and wake display
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        activeActivity = this
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (activeActivity === this) activeActivity = null
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (activeActivity === this) activeActivity = null
+    }
+
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         bootPrefs = getSharedPreferences(BootReceiver.PREFS_NAME, Context.MODE_PRIVATE)
         settingsPrefs = getSharedPreferences(SETTINGS_PREFS, Context.MODE_PRIVATE)
+
+        // Pre-seed API key if unset
+        if (settingsPrefs.getString("gemini_api_key", "").isNullOrBlank()) {
+            settingsPrefs.edit().putString("gemini_api_key", DEFAULT_GEMINI_KEY).apply()
+        }
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL)
             .setMethodCallHandler { call, result ->
@@ -77,6 +118,14 @@ class MainActivity : FlutterActivity() {
                     }
                     "checkPermissions"       -> result.success(checkPermissions())
                     "getActiveWakeEngine"    -> result.success(CoreVoiceService.activeEngineName)
+                    "getLaunchIntentType" -> {
+                        val isAssist = intent?.action == Intent.ACTION_ASSIST
+                        result.success(if (isAssist) "assist" else "normal")
+                    }
+                    "getScreenContext" -> {
+                        val text = DeviceOperatorService.instance?.extractScreenText() ?: ""
+                        result.success(text)
+                    }
                     "triggerAssistant"       -> {
                         val i = Intent(this, CoreVoiceService::class.java).also { it.action = "TRIGGER_MANUAL" }
                         startService(i)
@@ -153,7 +202,17 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "getGeminiApiKey" -> {
-                        result.success(settingsPrefs.getString("gemini_api_key", ""))
+                        val key = settingsPrefs.getString("gemini_api_key", "")?.trim() ?: ""
+                        result.success(if (key.isNotBlank()) key else DEFAULT_GEMINI_KEY)
+                    }
+                    "addCustomAlias" -> {
+                        val phrase = call.argument<String>("phrase") ?: ""
+                        val action = call.argument<String>("action") ?: ""
+                        if (phrase.isNotBlank() && action.isNotBlank()) {
+                            VoiceLearningStore.initialize(applicationContext)
+                            VoiceLearningStore.learn(phrase, action)
+                        }
+                        result.success(true)
                     }
                     "setSttDelays" -> {
                         val map = call.arguments as? Map<String, Any?>

@@ -24,7 +24,9 @@ class GeminiIntentBridge(private val context: Context) {
     }
 
     fun interpret(transcript: String): LocalCommandProcessor.Result? {
-        val key = prefs.getString("gemini_api_key", "")?.trim() ?: ""
+        val key = prefs.getString("gemini_api_key", "")?.trim().let { 
+            if (it.isNullOrBlank()) MainActivity.DEFAULT_GEMINI_KEY else it 
+        }
         if (key.isBlank()) return null
 
         return try {
@@ -49,27 +51,43 @@ class GeminiIntentBridge(private val context: Context) {
                 })
             }
 
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$key")
-            val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = "POST"
-            connection.doOutput = true
-            connection.connectTimeout = 6_000
-            connection.readTimeout = 6_000
-            connection.setRequestProperty("Content-Type", "application/json")
-            connection.setRequestProperty("Accept", "application/json")
+            val restModel = BuildConfig.GEMINI_REST_MODEL.ifBlank { "gemini-3.8-flash" }
+            val modelsToTry = if (restModel != "gemini-3.5-flash") listOf(restModel, "gemini-3.5-flash") else listOf(restModel)
+            var responseCode = -1
+            var raw = ""
 
-            connection.outputStream.use { stream ->
-                stream.write(requestBody.toString().toByteArray(Charsets.UTF_8))
-                stream.flush()
+            for (model in modelsToTry) {
+                try {
+                    val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$key")
+                    val connection = url.openConnection() as HttpURLConnection
+                    connection.requestMethod = "POST"
+                    connection.doOutput = true
+                    connection.connectTimeout = 5_000
+                    connection.readTimeout = 5_000
+                    connection.setRequestProperty("Content-Type", "application/json")
+                    connection.setRequestProperty("Accept", "application/json")
+
+                    connection.outputStream.use { stream ->
+                        stream.write(requestBody.toString().toByteArray(Charsets.UTF_8))
+                        stream.flush()
+                    }
+
+                    responseCode = connection.responseCode
+                    if (responseCode in 200..299) {
+                        raw = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+                        break
+                    } else {
+                        Log.w("GeminiIntentBridge", "Model $model returned $responseCode, trying next fallback...")
+                    }
+                } catch (e: Exception) {
+                    Log.w("GeminiIntentBridge", "Error calling $model: ${e.message}")
+                }
             }
 
-            val responseCode = connection.responseCode
-            if (responseCode !in 200..299) {
-                Log.w("GeminiIntentBridge", "Gemini API returned $responseCode")
+            if (raw.isBlank() || responseCode !in 200..299) {
+                Log.w("GeminiIntentBridge", "All Gemini REST models failed")
                 return null
             }
-
-            val raw = connection.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
             val root = JSONObject(raw)
             val candidates = root.optJSONArray("candidates") ?: return null
             val first = candidates.optJSONObject(0) ?: return null

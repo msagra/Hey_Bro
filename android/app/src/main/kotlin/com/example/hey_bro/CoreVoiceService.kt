@@ -1,6 +1,7 @@
 package com.example.hey_bro
 
 import android.annotation.SuppressLint
+import android.app.ActivityOptions
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,8 +14,12 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -49,6 +54,7 @@ class CoreVoiceService : Service(),
         private const val SAMPLE_RATE     = 16000
         private const val KEY_BACKEND_WS  = "backend_ws"
         private const val DEFAULT_BACKEND_WS = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+        private val DEFAULT_GEMINI_KEY: String get() = BuildConfig.GEMINI_API_KEY
 
         var activeEngineName: String = "None"
         var eventSink: EventChannel.EventSink? = null
@@ -134,7 +140,8 @@ class CoreVoiceService : Service(),
     private var lastDispatchedActionSignature = ""
     private var lastDispatchedActionAtMs = 0L
     @Volatile private var serviceDestroyed = false
-    private val backendResponseHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val backendResponseHandler = mainHandler
     private var backendFallbackPending = false
 
     private val backendFallbackRunnable = Runnable {
@@ -155,6 +162,7 @@ class CoreVoiceService : Service(),
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
     private val PICOVOICE_ACCESS_KEY = "YOUR_PICOVOICE_ACCESS_KEY_HERE"
+    private var cpuWakeLock: PowerManager.WakeLock? = null
     private var lastWakeAtMs = 0L
     private var lastFailedListenAtMs = 0L
 
@@ -166,6 +174,18 @@ class CoreVoiceService : Service(),
         super.onCreate()
         serviceDestroyed = false
         Log.d(TAG, "Service created")
+
+        // Acquire CPU Partial WakeLock for Dimensity 9400+ efficiency cores on screen-off
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            cpuWakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HeyBro:WakeCPU")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            Log.d(TAG, "Acquired HeyBro:WakeCPU partial wake lock")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to acquire CPU wake lock: ${e.message}")
+        }
         createNotificationChannel()
         prefs = getSharedPreferences("hey_bro_settings", Context.MODE_PRIVATE)
         activeInstance = this
@@ -194,21 +214,32 @@ class CoreVoiceService : Service(),
     }
 
     private fun configureBackendStreamer() {
-        val apiKey = prefs.getString("gemini_api_key", "")?.trim() ?: ""
+        val apiKey = prefs.getString("gemini_api_key", "")?.trim().let { if (it.isNullOrBlank()) DEFAULT_GEMINI_KEY else it }
         val configuredWs = prefs.getString(KEY_BACKEND_WS, DEFAULT_BACKEND_WS)?.trim() ?: ""
-        val target = if (apiKey.isNotBlank() && (configuredWs.isBlank() || configuredWs.contains("onrender.com") || configuredWs.contains("googleapis.com"))) {
+        if (configuredWs.equals("offline", ignoreCase = true)) {
+            backendWsUrl = null
+            audioStreamer?.stopAll()
+            audioStreamer = null
+            return
+        }
+        val target = if (apiKey.isNotBlank() && (configuredWs.isBlank() || configuredWs.contains("googleapis.com"))) {
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         } else if (configuredWs.isNotBlank()) {
-            if (configuredWs.contains("googleapis.com") && !configuredWs.contains("key=") && apiKey.isNotBlank()) {
-                "$configuredWs?key=$apiKey"
+            if (configuredWs.contains("googleapis.com")) {
+                if (apiKey.isNotBlank()) {
+                    if (configuredWs.contains("key=")) configuredWs else "$configuredWs?key=$apiKey"
+                } else {
+                    DEFAULT_BACKEND_WS
+                }
             } else {
                 configuredWs
             }
         } else if (apiKey.isNotBlank()) {
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
         } else {
-            return
+            DEFAULT_BACKEND_WS
         }
+        backendWsUrl = target
         audioStreamer = AudioStreamer(object : AudioStreamerListener {
             override fun onResponseComplete() {
                 cancelBackendFallback()
@@ -258,6 +289,7 @@ class CoreVoiceService : Service(),
                 dispatchDeviceCommand(payload)
             }
         })
+        audioStreamer?.setPowerManager(getSystemService(Context.POWER_SERVICE) as? PowerManager)
         audioStreamer?.connect(target)
     }
 
@@ -317,8 +349,8 @@ class CoreVoiceService : Service(),
     private fun applyBackendWs(url: String) {
         val trimmed = url.trim()
         Log.i(TAG, "Backend switch request: '$url'")
-        val apiKey = prefs.getString("gemini_api_key", "")?.trim() ?: ""
-        if (trimmed.isEmpty() && apiKey.isEmpty()) {
+        val apiKey = prefs.getString("gemini_api_key", "")?.trim().let { if (it.isNullOrBlank()) DEFAULT_GEMINI_KEY else it }
+        if (trimmed.equals("offline", ignoreCase = true)) {
             backendWsUrl = null
             audioStreamer?.stopAll()
             audioStreamer = null
@@ -326,21 +358,29 @@ class CoreVoiceService : Service(),
             Log.i(TAG, "Backend: offline local engine")
             return
         }
-        backendWsUrl = if (trimmed.isNotEmpty()) trimmed else null
+
+        val targetUrl = if (apiKey.isNotBlank() && (trimmed.isBlank() || trimmed.contains("googleapis.com"))) {
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        } else if (trimmed.isNotBlank()) {
+            if (trimmed.contains("googleapis.com")) {
+                if (apiKey.isNotBlank()) {
+                    if (trimmed.contains("key=")) trimmed else "$trimmed?key=$apiKey"
+                } else {
+                    DEFAULT_BACKEND_WS
+                }
+            } else {
+                trimmed
+            }
+        } else if (apiKey.isNotBlank()) {
+            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+        } else {
+            DEFAULT_BACKEND_WS
+        }
+
+        backendWsUrl = targetUrl
         if (audioStreamer == null) {
             configureBackendStreamer()
         } else {
-            val targetUrl = if (apiKey.isNotBlank() && (trimmed.isBlank() || trimmed.contains("onrender.com") || trimmed.contains("googleapis.com"))) {
-                "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
-            } else if (trimmed.isNotBlank()) {
-                if (trimmed.contains("googleapis.com") && !trimmed.contains("key=") && apiKey.isNotBlank()) {
-                    "$trimmed?key=$apiKey"
-                } else {
-                    trimmed
-                }
-            } else {
-                "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
-            }
             audioStreamer?.connect(targetUrl)
         }
     }
@@ -401,6 +441,10 @@ class CoreVoiceService : Service(),
         try { ttsEngine.destroy() } catch (_: Exception) {}
         try { overlayManager.destroy() } catch (_: Exception) {}
         try { serviceJob.cancel() } catch (_: Exception) {}
+        try {
+            if (cpuWakeLock?.isHeld == true) cpuWakeLock?.release()
+        } catch (_: Exception) {}
+        cpuWakeLock = null
         abandonAudioFocus()
         activeInstance = null
         super.onDestroy()
@@ -477,15 +521,36 @@ class CoreVoiceService : Service(),
 
     override fun onPartialResult(transcript: String) {
         if (serviceState != ServiceState.LISTENING) return
+
+        // Upgrade B2: Parallel Local Fast-Path (<50ms execution on first transcript chunk)
+        val fastResult = LocalCommandProcessor.checkFastPath(transcript)
+        if (fastResult != null && fastResult.action != null) {
+            Log.i(TAG, "High-confidence parallel fast-path triggered in <50ms: \"$transcript\"")
+            try { sttEngine.stopListening() } catch (_: Exception) {}
+            onResult(transcript)
+            return
+        }
+
+        val lower = transcript.lowercase().trim()
         val fastActions = listOf(
             "flashlight on", "turn on flashlight", "turn flashlight on",
             "flashlight off", "turn off flashlight", "turn flashlight off",
+            "torch on", "turn on torch", "turn torch on",
+            "torch off", "turn off torch", "turn torch off",
             "take photo", "take a photo", "take selfie", "take a selfie",
             "take screenshot", "take a screenshot", "screenshot",
-            "volume up", "increase volume", "volume down", "decrease volume", "mute"
+            "volume up", "increase volume", "volume down", "decrease volume", "mute",
+            "wifi on", "turn on wifi", "wifi off", "turn off wifi",
+            "bluetooth on", "turn on bluetooth", "bluetooth off", "turn off bluetooth",
+            "hotspot on", "turn on hotspot", "hotspot off", "turn off hotspot",
+            "what is the time", "what time is it", "current time",
+            "battery level", "battery percentage", "how much battery",
+            "go back", "go home", "lock screen", "stop listening", "go to sleep"
         )
-        val lower = transcript.lowercase().trim()
-        if (fastActions.any { lower.contains(it) }) {
+        val hasFastAction = fastActions.any { lower.contains(it) } ||
+            (lower.length >= 7 && LocalCommandProcessor.process(lower).action != null)
+
+        if (hasFastAction) {
             Log.i(TAG, "High-confidence partial action detected: \"$transcript\" - executing immediately")
             try { sttEngine.stopListening() } catch (_: Exception) {}
             onResult(transcript)
@@ -513,14 +578,14 @@ class CoreVoiceService : Service(),
 
         Log.w(TAG, "STT error $errorCode (count=$sttFailureCount)${if (msg != null) ": $msg" else " (silent)"}")
 
-        val retryDelays = longArrayOf(900L)
+        val retryDelays = longArrayOf(600L)
         val shouldRetry = errorCode == SpeechRecognizer.ERROR_AUDIO && sttFailureCount <= retryDelays.size
 
         if (shouldRetry) {
             val idx = (sttFailureCount - 1).coerceAtLeast(0).coerceAtMost(retryDelays.size - 1)
             val delayMs = retryDelays.getOrNull(idx) ?: 3000L
             Log.d(TAG, "Transient STT error; scheduling retry #$sttFailureCount (delay=${delayMs}ms)")
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            mainHandler.postDelayed({
                 try {
                     if (serviceState != ServiceState.LISTENING) {
                         transitionTo(ServiceState.LISTENING)
@@ -544,7 +609,7 @@ class CoreVoiceService : Service(),
             return
         }
 
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
+        mainHandler.post {
             sttRetryInFlight = false
             abandonAudioFocus()
 
@@ -576,8 +641,8 @@ class CoreVoiceService : Service(),
                 pushEvent(mapOf("state" to "LISTENING"))
                 updateNotification("I'm listening…")
 
-                val postTtsDelay = prefs.getLong("stt_post_tts_ms", 350L).coerceIn(0L, 600L)
-                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                val postTtsDelay = prefs.getLong("stt_post_tts_ms", 200L).coerceIn(0L, 600L)
+                mainHandler.postDelayed({
                     if (audioStreamer?.isConnected() == true) {
                         audioStreamer?.sendWakeWordTriggered()
                         requestAudioFocus()
@@ -586,7 +651,7 @@ class CoreVoiceService : Service(),
                         try {
                             val gotFocus = requestAudioFocus()
                             if (!gotFocus) {
-                                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                                mainHandler.postDelayed({
                                     try {
                                         requestAudioFocus()
                                         sttEngine.startListeningPostTts(250L)
@@ -618,9 +683,9 @@ class CoreVoiceService : Service(),
 
             val activeWakeEngine = wakeWordManager?.activeEngine
             if (activeWakeEngine is HeyBroPhraseWakeEngine) {
-                activeWakeEngine.setWakeCallback {
+                activeWakeEngine.setWakeCallback { directCommand ->
                     if (serviceState == ServiceState.IDLE) {
-                        onWakeWordDetected()
+                        onWakeWordDetected(directCommand)
                     }
                 }
             }
@@ -666,6 +731,32 @@ class CoreVoiceService : Service(),
         }
     }
 
+    // ── Safe AudioRecord Creation ─────────────────────────────────────────────
+    private fun createAudioRecord(sampleRate: Int, bufferSize: Int): AudioRecord? {
+        val sources = intArrayOf(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.MIC,
+            MediaRecorder.AudioSource.DEFAULT
+        )
+        for (source in sources) {
+            try {
+                val rec = AudioRecord(
+                    source,
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufferSize
+                )
+                if (rec.state == AudioRecord.STATE_INITIALIZED) {
+                    return rec
+                } else {
+                    try { rec.release() } catch (_: Throwable) {}
+                }
+            } catch (_: Throwable) {}
+        }
+        return null
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Wake word audio loop
     // ─────────────────────────────────────────────────────────────────────────
@@ -690,12 +781,6 @@ class CoreVoiceService : Service(),
     private fun startWakeWordLoop() {
         if (audioJob?.isActive == true) return
 
-        val activeEngine = wakeWordManager?.getActiveEngineName() ?: ""
-        if (activeEngine.contains("HeyBroPhraseWakeEngine", ignoreCase = true)) {
-            Log.i(TAG, "Wake phrase detection is handled by dedicated SpeechRecognizer; skipping generic audio loop")
-            return
-        }
-
         audioJob = scope.launch {
             var recorder: AudioRecord? = null
             try {
@@ -705,22 +790,25 @@ class CoreVoiceService : Service(),
                 )
                 val bufSize = maxOf(minBuf, frameLength * 2)
 
-                val createdRecorder = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
-                )
+                val createdRecorder = createAudioRecord(SAMPLE_RATE, bufSize)
+                if (createdRecorder == null) {
+                    Log.e(TAG, "Wake word loop: failed to initialize AudioRecord across audio sources")
+                    return@launch
+                }
                 recorder = createdRecorder
                 synchronized(audioRecordLock) {
                     audioRecord = createdRecorder
-                    createdRecorder.startRecording()
+                    try {
+                        createdRecorder.startRecording()
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Wake word loop startRecording failed: ${e.message}")
+                        return@launch
+                    }
                 }
 
                 val buffer = ShortArray(frameLength)
 
-                Log.i(TAG, "Wake word audio loop started (engine: $activeEngineName)")
+                Log.i(TAG, "Continuous 16kHz AudioRecord wake loop active (OriginOS 6 / Dimensity 9400+ background mic)")
 
                 while (isActive) {
                     val rec = synchronized(audioRecordLock) { audioRecord } ?: break
@@ -735,6 +823,13 @@ class CoreVoiceService : Service(),
                     if (read != frameLength) continue
 
                     if (serviceState == ServiceState.IDLE) {
+                        // Check Silero VAD score to gate CPU processing
+                        val vadScore = try { sileroVad?.isSpeech(buffer, SAMPLE_RATE) ?: -1f } catch (_: Exception) { -1f }
+                        if (vadScore >= 0.35f) {
+                            // Upgrade B1: Speculative pre-warming of Gemini 3.8 Live WebSocket on speech onset
+                            audioStreamer?.prewarm(backendWsUrl ?: "")
+                        }
+
                         if (wakeWordManager?.process(buffer) == true) {
                             Log.i(TAG, "Wake word detected by ${wakeWordManager?.getActiveEngineName()}")
                             onWakeWordDetected()
@@ -754,14 +849,14 @@ class CoreVoiceService : Service(),
     //  Wake word / state transitions
     // ─────────────────────────────────────────────────────────────────────────
 
-    private fun onWakeWordDetected() {
+    private fun onWakeWordDetected(directCommand: String? = null) {
         val nowMs = SystemClock.elapsedRealtime()
         if (serviceState != ServiceState.IDLE) return
-        if (nowMs - lastWakeAtMs < 4_000L) {
+        if (nowMs - lastWakeAtMs < 3_000L) {
             Log.d(TAG, "Wake cooldown active; ignoring extra trigger")
             return
         }
-        if (nowMs - lastFailedListenAtMs < 5_000L) {
+        if (nowMs - lastFailedListenAtMs < 3_000L) {
             Log.d(TAG, "Recent STT failure cooldown active; not re-triggering wake detection")
             return
         }
@@ -776,8 +871,48 @@ class CoreVoiceService : Service(),
         }
         releaseWakeRecorder()
 
-        transitionTo(ServiceState.LISTENING)
         playFeedback()
+
+        // OriginOS 6: Light up the display if screen is currently off
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            if (pm != null && !pm.isInteractive) {
+                @Suppress("DEPRECATION")
+                val screenLock = pm.newWakeLock(
+                    PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                    "HeyBro:ScreenWake"
+                )
+                screenLock.acquire(5000L) // 5s illumination
+                Log.i(TAG, "OriginOS 6: Screen turned on via ACQUIRE_CAUSES_WAKEUP")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Screen wake failed: ${e.message}")
+        }
+
+        // Android 15: Launch MainActivity over lockscreen using PendingIntent with BACKGROUND_ACTIVITY_START_ALLOWED
+        try {
+            val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
+                action = Intent.ACTION_ASSIST
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            }
+            val options = if (Build.VERSION.SDK_INT >= 34) {
+                ActivityOptions.makeBasic().apply {
+                    setPendingIntentBackgroundActivityStartMode(ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED)
+                }
+            } else {
+                ActivityOptions.makeBasic()
+            }
+            val pi = PendingIntent.getActivity(
+                applicationContext,
+                0,
+                launchIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                options.toBundle()
+            )
+            pi.send()
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to launch lockscreen overlay via PendingIntent: ${e.message}")
+        }
 
         val engineName = wakeWordManager?.getActiveEngineName() ?: ""
         if (engineName.contains("Native", ignoreCase = true) ||
@@ -789,6 +924,20 @@ class CoreVoiceService : Service(),
             activeEngineName = "None"
         }
 
+        // Fast-path: if the user spoken a complete command along with the wake phrase
+        // (e.g. "Hey bro turn on flashlight"), execute it immediately without interrupting
+        // them with a spoken greeting!
+        if (!directCommand.isNullOrBlank()) {
+            Log.i(TAG, "One-shot wake word with direct command: '$directCommand'")
+            transitionTo(ServiceState.PROCESSING)
+            overlayManager.show(OverlayManager.State.PROCESSING, directCommand.take(40))
+            pushEvent(mapOf("state" to "PROCESSING", "transcript" to directCommand, "activeEngine" to activeEngineName))
+            updateNotification("Processing: $directCommand")
+            onResult(directCommand)
+            return
+        }
+
+        transitionTo(ServiceState.LISTENING)
         overlayManager.show(OverlayManager.State.LISTENING)
         pushEvent(mapOf("state" to "LISTENING", "activeEngine" to activeEngineName))
         updateNotification("I'm listening…")
@@ -801,8 +950,8 @@ class CoreVoiceService : Service(),
         )
         
         awaitingCommandAfterAck = true
-        val ackDelay = prefs.getLong("stt_ack_ms", 250L)
-        android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+        val ackDelay = prefs.getLong("stt_ack_ms", 100L)
+        mainHandler.postDelayed({
             if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
                 ttsEngine.speak(greetings.random())
             }
@@ -827,7 +976,7 @@ class CoreVoiceService : Service(),
         } else if (serviceState == ServiceState.SPEAKING) {
             ttsEngine.stop()
             resetToIdle()
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            mainHandler.postDelayed({
                 onWakeWordDetected()
             }, 200)
         }
@@ -840,15 +989,16 @@ class CoreVoiceService : Service(),
         sttEngine.stopListening()
 
         synchronized(audioRecordLock) {
-            if (audioRecord?.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                try { audioRecord?.startRecording() } catch (_: Exception) {}
+            val rec = audioRecord
+            if (rec != null && rec.state == AudioRecord.STATE_INITIALIZED && rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                try { rec.startRecording() } catch (_: Throwable) {}
             }
         }
 
         if (wakeWordManager?.activeEngine == null) {
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+            mainHandler.postDelayed({
                 scheduleWakeReinit()
-            }, 600)
+            }, 300)
         }
 
         updateNotification("Say \"Hey Bro\" to activate")
@@ -868,7 +1018,7 @@ class CoreVoiceService : Service(),
 
         if (sttRetryInFlight || sttFailureCount > 0) {
             Log.d(TAG, "Deferring WakeWordManager re-init due to STT retry state")
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 1000)
+            mainHandler.postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 1000)
             return
         }
 
@@ -876,7 +1026,7 @@ class CoreVoiceService : Service(),
             initWakeWordEngine()
         } catch (e: Exception) {
             Log.w(TAG, "WakeWordManager re-init failed: ${e.message}")
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 1000)
+            mainHandler.postDelayed({ scheduleWakeReinit(attemptsLeft - 1) }, 1000)
         }
     }
 
@@ -920,37 +1070,79 @@ class CoreVoiceService : Service(),
         captureJob?.cancel()
         captureJob = scope.launch {
             var recorder: AudioRecord? = null
+            var noiseSuppressor: NoiseSuppressor? = null
+            var echoCanceler: AcousticEchoCanceler? = null
+            var gainControl: AutomaticGainControl? = null
+
             try {
                 try { sttEngine.stopListening() } catch (_: Exception) {}
 
                 val sampleRate = SAMPLE_RATE
                 val frameSize = 512
                 val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
-                val bufSize = maxOf(minBuf, frameSize * 2)
+                val bufSize = maxOf(minBuf, frameSize * 4)
 
-                recorder = AudioRecord(
-                    MediaRecorder.AudioSource.MIC,
-                    sampleRate,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    bufSize
-                )
-                recorder.startRecording()
+                val createdRecorder = createAudioRecord(sampleRate, bufSize)
+                if (createdRecorder == null) {
+                    Log.e(TAG, "Capture audio: failed to initialize AudioRecord; falling back to local STT")
+                    if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
+                        requestAudioFocus()
+                        try { sttEngine.startListening() } catch (_: Throwable) {}
+                    }
+                    return@launch
+                }
+                recorder = createdRecorder
+
+                try {
+                    val sessionId = recorder.audioSessionId
+                    if (NoiseSuppressor.isAvailable()) {
+                        try { noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply { enabled = true } } catch (_: Throwable) {}
+                    }
+                    if (AcousticEchoCanceler.isAvailable()) {
+                        try { echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply { enabled = true } } catch (_: Throwable) {}
+                    }
+                    if (AutomaticGainControl.isAvailable()) {
+                        try { gainControl = AutomaticGainControl.create(sessionId)?.apply { enabled = true } } catch (_: Throwable) {}
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Audio effects init: ${e.message}")
+                }
+
+                try {
+                    recorder.startRecording()
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Capture audio startRecording failed: ${e.message}")
+                    if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
+                        requestAudioFocus()
+                        try { sttEngine.startListening() } catch (_: Throwable) {}
+                    }
+                    return@launch
+                }
 
                 val shortBuf = ShortArray(frameSize)
                 var speechDetected = false
                 var silenceFrames = 0
-                val maxSilenceFrames = 12 // ~384ms fast EOS — prevents premature cutoff on natural pauses
-                val noSpeechTimeoutMs = 5000L
+                // 24 frames at 32ms each = ~768ms silence tolerance
+                // This gives users natural space to pause and breathe without cut-offs!
+                val maxSilenceFrames = 24
+                var speechFramesCount = 0
+                val minSpeechFrames = 4 // Require ~128ms genuine speech before allowing EOS trigger
+                val noSpeechTimeoutMs = 6000L
                 val maxDurationMs = 15000L
                 val startMs = SystemClock.elapsedRealtime()
 
-                // Dynamic Noise Floor Calibration
-                var noiseFloorRms = 0.002f
-                var calibrationFrames = 0
-                val calibrationFramesTarget = 5 // First ~160ms used to measure room noise
+                // Rolling pre-roll ring buffer (~256ms) so opening consonants and words are never clipped
+                val preRollBuffer = ArrayDeque<ByteArray>(8)
 
-                Log.d(TAG, "Dynamic capture engine started")
+                // Dynamic Noise Floor Calibration with exponential moving average
+                var noiseFloorRms = 0.002f
+
+                // DC-blocking 1-pole high-pass filter (~80Hz cutoff) to eliminate DC offset and sub-bass table rumble
+                var hpPrevX = 0f
+                var hpPrevY = 0f
+                val hpAlpha = 0.985f
+
+                Log.d(TAG, "Dynamic crystal-clear capture engine started")
 
                 while (isActive && SystemClock.elapsedRealtime() - startMs < maxDurationMs) {
                     if (audioStreamer?.isConnected() != true) {
@@ -963,7 +1155,34 @@ class CoreVoiceService : Service(),
                     val r = recorder.read(shortBuf, 0, frameSize)
                     if (r <= 0) continue
 
-                    // 1. Calculate Frame RMS
+                    // 1. DC-offset & rumble removal + peak measurement
+                    var maxSample = 0
+                    for (i in 0 until r) {
+                        val x = shortBuf[i].toFloat()
+                        val y = x - hpPrevX + hpAlpha * hpPrevY
+                        hpPrevX = x
+                        hpPrevY = y
+                        val filtered = y.coerceIn(-32768f, 32767f).toInt().toShort()
+                        shortBuf[i] = filtered
+                        val abs = kotlin.math.abs(filtered.toInt())
+                        if (abs > maxSample) maxSample = abs
+                    }
+
+                    // Adaptive soft pre-amplification for low microphone input
+                    val softGain = when {
+                        maxSample in 1..3500 -> 2.0f
+                        maxSample in 3501..7500 -> 1.4f
+                        maxSample in 7501..12000 -> 1.2f
+                        else -> 1.0f
+                    }
+                    if (softGain > 1.0f) {
+                        for (i in 0 until r) {
+                            val scaled = (shortBuf[i] * softGain).toInt().coerceIn(-32768, 32767).toShort()
+                            shortBuf[i] = scaled
+                        }
+                    }
+
+                    // 2. Calculate Frame RMS
                     var sum = 0.0
                     for (i in 0 until r) {
                         val norm = shortBuf[i].toDouble() / Short.MAX_VALUE
@@ -971,43 +1190,22 @@ class CoreVoiceService : Service(),
                     }
                     val currentRms = kotlin.math.sqrt(sum / r.coerceAtLeast(1)).toFloat()
 
-                    // Calibration step for noisy environments
-                    if (calibrationFrames < calibrationFramesTarget) {
-                        noiseFloorRms = ((noiseFloorRms * calibrationFrames) + currentRms) / (calibrationFrames + 1)
-                        calibrationFrames++
-                        continue
+                    // 2. Query Silero VAD (with smoothed hysteresis)
+                    val vadScore = try { sileroVad?.isSpeech(shortBuf, sampleRate) ?: -1f } catch (_: Exception) { -1f }
+                    val vadSmoothed = try { sileroVad?.isSpeechSmoothed(shortBuf, 0.32f, sampleRate) ?: false } catch (_: Exception) { false }
+
+                    // Adapt noise floor only during verified non-speech frames
+                    if (!speechDetected && vadScore in 0f..0.20f) {
+                        noiseFloorRms = (noiseFloorRms * 0.95f) + (currentRms * 0.05f)
                     }
 
                     // Adaptive thresholds based on measured noise floor
-                    val activeSpeechThreshold = (noiseFloorRms * 2.2f).coerceIn(0.005f, 0.025f)
-                    val silenceThreshold = (noiseFloorRms * 1.3f).coerceIn(0.003f, 0.015f)
+                    val activeSpeechThreshold = (noiseFloorRms * 2.0f).coerceIn(0.004f, 0.025f)
+                    val silenceThreshold = (noiseFloorRms * 1.3f).coerceIn(0.0025f, 0.015f)
 
-                    // 2. Query Silero VAD
-                    val vadScore = try { sileroVad?.isSpeech(shortBuf, sampleRate) ?: -1f } catch (_: Exception) { -1f }
-                    val isSpeechFrame = (vadScore > 0.35f) || (currentRms > activeSpeechThreshold)
+                    val isSpeechFrame = vadSmoothed || (vadScore > 0.32f) || (currentRms > activeSpeechThreshold)
 
-                    if (!speechDetected) {
-                        if (isSpeechFrame) {
-                            speechDetected = true
-                            silenceFrames = 0
-                            audioStreamer?.interruptPlayback()
-                            Log.d(TAG, "Speech confirmed (RMS: $currentRms, NoiseFloor: $noiseFloorRms, VAD: $vadScore)")
-                        } else if (SystemClock.elapsedRealtime() - startMs >= noSpeechTimeoutMs) {
-                            Log.d(TAG, "Silence timeout (${noSpeechTimeoutMs}ms); resetting to idle")
-                            resetToIdle()
-                            pushEvent(mapOf("state" to "IDLE"))
-                            break
-                        }
-                    } else {
-                        val isSilence = (vadScore in 0f..0.20f && currentRms < silenceThreshold) || (!isSpeechFrame && currentRms < silenceThreshold)
-                        if (isSilence) {
-                            silenceFrames++
-                        } else {
-                            silenceFrames = 0
-                        }
-                    }
-
-                    // 3. Stream PCM chunk to backend
+                    // 3. Convert frame to PCM byte chunk
                     val bytes = ByteArray(r * 2)
                     var bi = 0
                     for (i in 0 until r) {
@@ -1015,16 +1213,53 @@ class CoreVoiceService : Service(),
                         bytes[bi++] = (s.toInt() and 0xFF).toByte()
                         bytes[bi++] = ((s.toInt() shr 8) and 0xFF).toByte()
                     }
-                    audioStreamer?.sendAudioChunk(bytes)
 
-                    // 4. Fast End-of-Speech trigger
-                    if (speechDetected && silenceFrames >= maxSilenceFrames) {
-                        Log.i(TAG, "Fast EOS detected ($silenceFrames frames quiet). Closing audio stream.")
-                        audioStreamer?.sendEndOfSpeech()
-                        transitionTo(ServiceState.PROCESSING)
-                        overlayManager.show(OverlayManager.State.PROCESSING)
-                        pushEvent(mapOf("state" to "PROCESSING"))
-                        break
+                    if (!speechDetected) {
+                        // Keep last 8 frames (~256ms) in pre-roll buffer
+                        if (preRollBuffer.size >= 8) {
+                            preRollBuffer.removeFirst()
+                        }
+                        preRollBuffer.addLast(bytes)
+
+                        if (isSpeechFrame) {
+                            speechDetected = true
+                            speechFramesCount = 1
+                            silenceFrames = 0
+                            audioStreamer?.interruptPlayback()
+                            Log.d(TAG, "Speech confirmed (RMS: $currentRms, NoiseFloor: $noiseFloorRms, VAD: $vadScore)")
+                            
+                            // Flush pre-roll buffer so the beginning of user speech is perfectly heard
+                            while (preRollBuffer.isNotEmpty()) {
+                                audioStreamer?.sendAudioChunk(preRollBuffer.removeFirst())
+                            }
+                            audioStreamer?.sendAudioChunk(bytes)
+                        } else if (SystemClock.elapsedRealtime() - startMs >= noSpeechTimeoutMs) {
+                            Log.d(TAG, "Silence timeout (${noSpeechTimeoutMs}ms); resetting to idle")
+                            resetToIdle()
+                            pushEvent(mapOf("state" to "IDLE"))
+                            break
+                        }
+                    } else {
+                        // Speech already active: stream chunk in real-time
+                        audioStreamer?.sendAudioChunk(bytes)
+
+                        val isSilence = (!isSpeechFrame && currentRms < silenceThreshold) || (vadScore in 0f..0.20f && currentRms < silenceThreshold)
+                        if (isSilence) {
+                            silenceFrames++
+                        } else {
+                            speechFramesCount++
+                            silenceFrames = 0
+                        }
+
+                        // 4. Natural End-of-Speech trigger (avoids premature cutoffs)
+                        if (speechFramesCount >= minSpeechFrames && silenceFrames >= maxSilenceFrames) {
+                            Log.i(TAG, "Natural EOS detected ($silenceFrames frames quiet, $speechFramesCount spoken). Closing stream.")
+                            audioStreamer?.sendEndOfSpeech()
+                            transitionTo(ServiceState.PROCESSING)
+                            overlayManager.show(OverlayManager.State.PROCESSING)
+                            pushEvent(mapOf("state" to "PROCESSING"))
+                            break
+                        }
                     }
                 }
 
@@ -1039,8 +1274,18 @@ class CoreVoiceService : Service(),
                     try { sttEngine.startListening() } catch (_: Exception) {}
                 }
             } finally {
-                try { recorder?.stop() } catch (_: Exception) {}
-                try { recorder?.release() } catch (_: Exception) {}
+                try { noiseSuppressor?.release() } catch (_: Throwable) {}
+                try { echoCanceler?.release() } catch (_: Throwable) {}
+                try { gainControl?.release() } catch (_: Throwable) {}
+                val recToRelease = recorder
+                if (recToRelease != null) {
+                    try {
+                        if (recToRelease.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                            recToRelease.stop()
+                        }
+                    } catch (_: Throwable) {}
+                    try { recToRelease.release() } catch (_: Throwable) {}
+                }
                 captureJob = null
             }
         }
@@ -1049,7 +1294,7 @@ class CoreVoiceService : Service(),
     private fun scheduleBackendFallback() {
         backendResponseHandler.removeCallbacks(backendFallbackRunnable)
         backendFallbackPending = true
-        backendResponseHandler.postDelayed(backendFallbackRunnable, 4_000L)
+        backendResponseHandler.postDelayed(backendFallbackRunnable, 2_500L)
     }
 
     private fun cancelBackendFallback() {
@@ -1059,7 +1304,7 @@ class CoreVoiceService : Service(),
 
     private fun pushEvent(data: Map<String, String>) {
         val json = JSONObject(data).toString()
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
+        mainHandler.post {
             eventSink?.success(json)
         }
     }

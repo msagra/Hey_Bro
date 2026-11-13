@@ -2,9 +2,19 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:hey_bro/core/database_helper.dart';
+import 'package:hey_bro/ui/siri_orb_overlay.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await dotenv.load(fileName: '.env');
+  } catch (_) {
+    try {
+      await dotenv.load(fileName: '.env.example');
+    } catch (_) {}
+  }
   runApp(const HeyBroApp());
 }
 
@@ -94,15 +104,13 @@ class _DashboardScreenState extends State<DashboardScreen>
   // ── Service State ──────────────────────────────────────────────────────────
   bool           _serviceRunning = false;
   AssistantState _assistantState = AssistantState.idle;
-  String         _activeEngine   = 'None';
+  String         _activeEngine   = 'HeyBroPhraseWakeEngine';
   bool           _autostart      = false;
 
-  // ── Backend / server config ────────────────────────────────────────────────
-  static const _cloudWs   = 'wss://hey-bro-1zxk.onrender.com/ws/audio';
-  static const _localWs   = 'ws://192.168.10.150:8000/ws/audio';
-  static const _offlineWs = ''; // offline sentinel
-
-  String _backendWs   = _cloudWs;
+  // ── Gemini Live Endpoint ───────────────────────────────────────────────────
+  static const _geminiLiveWs =
+      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+  String _backendWs   = _geminiLiveWs;
   bool   _wsConnected = false;
 
   // ── Permissions ────────────────────────────────────────────────────────────
@@ -132,7 +140,6 @@ class _DashboardScreenState extends State<DashboardScreen>
   StreamSubscription? _eventSub;
   String?             _lastRawEvent;
 
-  // ─────────────────────────────────────────────────────────────────────────
   @override
   void initState() {
     super.initState();
@@ -147,6 +154,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     _checkPermissions();
     _permissionTimer = Timer.periodic(const Duration(seconds: 5), (_) => _checkPermissions());
     _loadBackendConfig();
+    _loadHistoryFromDb();
+    _checkLaunchIntent();
 
     _eventSub = _eventChannel.receiveBroadcastStream().listen(
       _onNativeEvent,
@@ -161,7 +170,6 @@ class _DashboardScreenState extends State<DashboardScreen>
       if (!_pulseCtrl.isAnimating) _pulseCtrl.repeat(reverse: true);
       if (!_waveCtrl.isAnimating) _waveCtrl.repeat();
     } else {
-      // PHASE 1: strictly stop and reset when idle/disconnected
       if (_pulseCtrl.isAnimating || _pulseCtrl.value != 0) { _pulseCtrl.stop(); _pulseCtrl.reset(); }
       if (_waveCtrl.isAnimating || _waveCtrl.value != 0) { _waveCtrl.stop(); _waveCtrl.reset(); }
     }
@@ -176,48 +184,47 @@ class _DashboardScreenState extends State<DashboardScreen>
     super.dispose();
   }
 
-  // Debug helpers
-  Future<Map<String, dynamic>> _getSttDelays() async {
+  Future<void> _checkLaunchIntent() async {
     try {
-      final res = await _platform.invokeMethod('getSttDelays');
-      return Map<String, dynamic>.from(res as Map);
+      final type = await _platform.invokeMethod<String>('getLaunchIntentType');
+      if (type == 'assist') {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _openSiriOverlay();
+        });
+      }
     } catch (e) {
-      return {'ackMs': 250, 'startMs': 2200, 'postTtsMs': 100};
+      debugPrint('getLaunchIntentType error: $e');
     }
   }
 
-  Future<void> _adjustStartDelay(int delta) async {
-    final current = await _getSttDelays();
-    final ack = (current['ackMs'] as num).toInt();
-    final start = (current['startMs'] as num).toInt();
-    final post = (current['postTtsMs'] as num).toInt();
-    final newStart = (start + delta).clamp(200, 10000);
-    await _platform.invokeMethod('setSttDelays', {'ackMs': ack, 'startMs': newStart, 'postTtsMs': post});
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('STT delay: ${newStart}ms'), duration: const Duration(seconds: 1)));
+  Future<void> _loadHistoryFromDb() async {
+    try {
+      final rows = await DatabaseHelper.instance.getConversations(limit: 40);
+      if (!mounted) return;
+      final loaded = <_Exchange>[];
+      for (int i = 0; i < rows.length; i++) {
+        final r = rows[i];
+        final role = r['role'] as String;
+        final msg = r['message'] as String;
+        if (role == 'assistant') {
+          String userMsg = '';
+          if (i + 1 < rows.length && rows[i + 1]['role'] == 'user') {
+            userMsg = rows[i + 1]['message'] as String;
+            i++;
+          }
+          loaded.add(_Exchange(user: userMsg, assistant: msg));
+        } else if (role == 'user') {
+          loaded.add(_Exchange(user: msg, assistant: ''));
+        }
+      }
+      setState(() {
+        _history.clear();
+        _history.addAll(loaded);
+      });
+    } catch (e) {
+      debugPrint('Error loading DB history: $e');
+    }
   }
-
-  Widget _buildDebugFab() {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        FloatingActionButton.small(
-          heroTag: 'inc',
-          onPressed: () => _adjustStartDelay(200),
-          child: const Icon(Icons.add),
-        ),
-        const SizedBox(height: 8),
-        FloatingActionButton.small(
-          heroTag: 'dec',
-          onPressed: () => _adjustStartDelay(-200),
-          child: const Icon(Icons.remove),
-        ),
-      ],
-    );
-  }
-
-  // ─────────────────────────────────────────────────────────────────────────
-  //  Event handling
-  // ─────────────────────────────────────────────────────────────────────────
 
   void _onNativeEvent(dynamic raw) {
     if (raw == _lastRawEvent) return;
@@ -239,14 +246,13 @@ class _DashboardScreenState extends State<DashboardScreen>
         case 'PLAYING':      newState = AssistantState.playing; break;
         case 'IDLE':         newState = AssistantState.idle; break;
         case 'CONNECTED':    newWsConnected = true; newState = AssistantState.idle; break;
-        case 'DISCONNECTED': newWsConnected = false; newState = _backendWs.isEmpty ? AssistantState.idle : AssistantState.disconnected; break;
+        case 'DISCONNECTED': newWsConnected = false; newState = AssistantState.disconnected; break;
       }
 
-      // PHASE 1: Throttled rebuilding – only if meaningful state changed
       final hasStateChanged = newState != _assistantState;
       final hasWsChanged = newWsConnected != _wsConnected;
       final hasEngineChanged = engine != null && engine != _activeEngine;
-      
+
       bool hasTranscriptChanged = false;
       if (newState == AssistantState.listening || newState == AssistantState.idle) {
         hasTranscriptChanged = _pendingTranscript != null;
@@ -259,42 +265,46 @@ class _DashboardScreenState extends State<DashboardScreen>
           _assistantState = newState;
           _wsConnected = newWsConnected;
           if (engine != null) _activeEngine = engine;
-          
+
           if (newState == AssistantState.listening || newState == AssistantState.idle) {
-             _pendingTranscript = null;
+            _pendingTranscript = null;
           } else if (transcript != null) {
-             _pendingTranscript = transcript;
+            _pendingTranscript = transcript;
           }
-          
+
           if (stateStr == 'PLAYING') {
             final finalTranscript = transcript ?? _pendingTranscript ?? '';
-            if (finalTranscript.isNotEmpty || response.isNotEmpty) {
+            if (response.isNotEmpty || finalTranscript.isNotEmpty) {
               _history.insert(0, _Exchange(user: finalTranscript, assistant: response));
-              if (_history.length > 20) _history.removeLast();
+              if (finalTranscript.isNotEmpty) {
+                DatabaseHelper.instance.insertConversation('user', finalTranscript);
+              }
+              if (response.isNotEmpty) {
+                DatabaseHelper.instance.insertConversation('assistant', response);
+              }
             }
+            _pendingTranscript = null;
           }
         });
+
         _updateTickers();
       }
     } catch (e) {
-      debugPrint('Event parse error: $e');
+      debugPrint('JSON parse error on event: $e');
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────────
-  //  Permissions
-  // ─────────────────────────────────────────────────────────────────────────
-
   Future<void> _checkPermissions() async {
     try {
-      final Map<Object?, Object?> perms =
-          await _platform.invokeMethod('checkPermissions');
-      final String engine =
-          await _platform.invokeMethod('getActiveWakeEngine');
-      final bool autostart =
-          await _platform.invokeMethod('getAutostartEnabled');
-      if (mounted) {
-        final newHasMic = perms['microphone'] == true;
+      final res = await _platform.invokeMethod('checkPermissions');
+      final engine = await _platform.invokeMethod<String>('getActiveWakeEngine') ?? 'None';
+      final autostart = await _platform.invokeMethod<bool>('getAutostartEnabled') ?? false;
+
+      if (!mounted) return;
+
+      if (res is Map) {
+        final perms = Map<String, dynamic>.from(res);
+        final newHasMic = perms['mic'] == true;
         final newHasCamera = perms['camera'] == true;
         final newHasA11y = perms['accessibility'] == true;
         final newHasOverlay = perms['overlay'] == true;
@@ -306,12 +316,12 @@ class _DashboardScreenState extends State<DashboardScreen>
         final newHasSendSms = perms['sendSms'] == true;
         final newHasNotificationAccess = perms['notificationAccess'] == true;
 
-        if (newHasMic != _hasMic || newHasCamera != _hasCamera || 
-            newHasA11y != _hasA11y || newHasOverlay != _hasOverlay || 
-          newHasBattery != _hasBattery || newHasPhone != _hasPhone ||
-          newHasCallLog != _hasCallLog || newHasContacts != _hasContacts ||
-          newHasReadSms != _hasReadSms || newHasSendSms != _hasSendSms ||
-          newHasNotificationAccess != _hasNotificationAccess || engine != _activeEngine || 
+        if (newHasMic != _hasMic || newHasCamera != _hasCamera ||
+            newHasA11y != _hasA11y || newHasOverlay != _hasOverlay ||
+            newHasBattery != _hasBattery || newHasPhone != _hasPhone ||
+            newHasCallLog != _hasCallLog || newHasContacts != _hasContacts ||
+            newHasReadSms != _hasReadSms || newHasSendSms != _hasSendSms ||
+            newHasNotificationAccess != _hasNotificationAccess || engine != _activeEngine ||
             autostart != _autostart) {
           setState(() {
             _hasMic     = newHasMic;
@@ -336,10 +346,6 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   bool get _allPermissionsGranted => _hasMic && _hasA11y && _hasOverlay;
-
-  // ─────────────────────────────────────────────────────────────────────────
-  //  Service control
-  // ─────────────────────────────────────────────────────────────────────────
 
   Future<void> _toggleService() async {
     if (_serviceRunning) {
@@ -381,106 +387,265 @@ class _DashboardScreenState extends State<DashboardScreen>
         _assistantState = AssistantState.idle;
       });
       _updateTickers();
-    } on PlatformException catch (e) {
-      _showSnack('Error: ${e.message}');
-    }
-  }
-
-  Future<void> _toggleAutostart(bool value) async {
-    try {
-      await _platform.invokeMethod('setAutostartEnabled', {'enabled': value});
-      setState(() => _autostart = value);
     } catch (e) {
-      debugPrint('setAutostart error: $e');
+      debugPrint('stopAssistantService error: $e');
     }
   }
 
   Future<void> _loadBackendConfig() async {
     try {
-      final url = await _platform.invokeMethod('getBackendWs') as String? ?? _cloudWs;
+      final url = await _platform.invokeMethod('getBackendWs') as String? ?? _geminiLiveWs;
       if (mounted) setState(() => _backendWs = url);
     } catch (e) {
       debugPrint('getBackendWs error: $e');
     }
   }
 
-  String get _backendLabel {
-    if (_backendWs == _cloudWs) return 'Cloud Server';
-    if (_backendWs == _localWs) return 'Local Server';
-    return 'Offline Engine';
-  }
+  Future<void> _openSiriOverlay() async {
+    String screenCtx = '';
+    try {
+      screenCtx = await _platform.invokeMethod<String>('getScreenContext') ?? '';
+    } catch (_) {}
 
-  Future<void> _pickServer() async {
-    final selected = await showDialog<String>(
+    if (!mounted) return;
+
+    showModalBottomSheet(
       context: context,
-      builder: (BuildContext ctx) {
-        return AlertDialog(
-          title: const Text('Select Backend'),
-          content: Column(
-            mainAxisSize: Map<String, dynamic>.from({}).isEmpty ? MainAxisSize.min : MainAxisSize.min,
-            children: [
-              _serverOption(ctx, label: 'Cloud Server', url: _cloudWs, icon: Icons.cloud_done_rounded),
-              const SizedBox(height: 8),
-              _serverOption(ctx, label: 'Local Server', url: _localWs, icon: Icons.lan_rounded),
-              const SizedBox(height: 8),
-              _serverOption(ctx, label: 'Offline Engine', url: _offlineWs, icon: Icons.phonelink_erase_rounded),
-            ],
-          ),
-          actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel'))],
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.transparent,
+      builder: (ctx) {
+        return SiriOrbOverlay(
+          state: _mapSiriState(_assistantState),
+          transcript: _pendingTranscript ?? '',
+          responseText: _history.isNotEmpty ? _history.first.assistant : '',
+          screenContext: screenCtx,
+          onMicTap: () async {
+            try {
+              await _platform.invokeMethod('triggerAssistant');
+            } catch (e) {
+              debugPrint('Trigger error: $e');
+            }
+          },
+          onDismiss: () => Navigator.of(ctx).pop(),
+          onInterrupt: () async {
+            try {
+              await _platform.invokeMethod('triggerAssistant');
+            } catch (_) {}
+          },
         );
       },
     );
-    if (selected != null) {
-      try {
-        await _platform.invokeMethod('setBackendWs', {'url': selected});
-        if (mounted) {
-          setState(() {
-            _backendWs = selected;
-            _wsConnected = false;
-          });
-          _showSnack('Backend: $_backendLabel');
-        }
-      } catch (e) {
-        _showSnack('Server switch failed');
-      }
+  }
+
+  SiriState _mapSiriState(AssistantState state) {
+    switch (state) {
+      case AssistantState.listening: return SiriState.listening;
+      case AssistantState.processing: return SiriState.processing;
+      case AssistantState.playing: return SiriState.speaking;
+      case AssistantState.idle:
+      case AssistantState.disconnected: return SiriState.idle;
     }
   }
 
-  Widget _serverOption(BuildContext ctx, {required String label, required String url, required IconData icon}) {
-    final selected = _backendWs == url;
-    final accent = selected ? const Color(0xFF00E5CC) : Colors.white38;
-    return Material(
-      color: Colors.transparent,
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: () => Navigator.pop(ctx, url),
-        child: ListTile(
-          selected: selected,
-          leading: Icon(icon, color: accent),
-          title: Text(label, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
+  Future<void> _openApiKeyDialog() async {
+    String currentKey = '';
+    try {
+      currentKey = await _platform.invokeMethod<String>('getGeminiApiKey') ?? '';
+    } catch (_) {}
+
+    if (currentKey.trim().isEmpty) {
+      final envKey = dotenv.env['GEMINI_API_KEY'] ?? '';
+      if (envKey.trim().isNotEmpty && !envKey.contains('your_gemini')) {
+        currentKey = envKey;
+      }
+    }
+
+    if (!mounted) return;
+    final ctrl = TextEditingController(text: currentKey);
+
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF141520),
+        title: const Text('Gemini API Key', style: TextStyle(color: Colors.white)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Configured for Gemini 3.8 Live WebSocket and offline REST fallback.',
+              style: TextStyle(color: Colors.white60, fontSize: 13),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: ctrl,
+              obscureText: true,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: InputDecoration(
+                filled: true,
+                fillColor: Colors.white.withValues(alpha: 0.08),
+                hintText: 'Enter your Gemini API key',
+                hintStyle: const TextStyle(color: Colors.white24),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          FilledButton(
+            onPressed: () async {
+              final newKey = ctrl.text.trim();
+              if (newKey.isNotEmpty) {
+                await _platform.invokeMethod('setGeminiApiKey', {'apiKey': newKey});
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Gemini API key updated')),
+                  );
+                }
+              }
+              if (ctx.mounted) Navigator.pop(ctx);
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _openAliasesDialog() async {
+    final aliases = await DatabaseHelper.instance.getAliases();
+    if (!mounted) return;
+
+    final phraseCtrl = TextEditingController();
+    final actionCtrl = TextEditingController();
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF12131D),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setModalState) => Padding(
+          padding: EdgeInsets.only(
+            left: 20, right: 20, top: 20,
+            bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  const Text('Custom Shortcuts (SQLite)', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                  IconButton(icon: const Icon(Icons.close, color: Colors.white54), onPressed: () => Navigator.pop(ctx)),
+                ],
+              ),
+              const Text('Add local voice shortcuts executed in <50ms without network', style: TextStyle(color: Colors.white54, fontSize: 12)),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: phraseCtrl,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: "Phrase (e.g. 'torch')",
+                        hintStyle: const TextStyle(color: Colors.white30),
+                        filled: true,
+                        fillColor: Colors.white.withValues(alpha: 0.06),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: TextField(
+                      controller: actionCtrl,
+                      style: const TextStyle(color: Colors.white, fontSize: 13),
+                      decoration: InputDecoration(
+                        hintText: "Action ('flashlightOn')",
+                        hintStyle: const TextStyle(color: Colors.white30),
+                        filled: true,
+                        fillColor: Colors.white.withValues(alpha: 0.06),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    icon: const Icon(Icons.add),
+                    onPressed: () async {
+                      final p = phraseCtrl.text.trim();
+                      final a = actionCtrl.text.trim();
+                      if (p.isNotEmpty && a.isNotEmpty) {
+                        await DatabaseHelper.instance.insertAlias(p, 'action', a);
+                        await _platform.invokeMethod('addCustomAlias', {'phrase': p, 'action': a});
+                        phraseCtrl.clear();
+                        actionCtrl.clear();
+                        final updated = await DatabaseHelper.instance.getAliases();
+                        setModalState(() {
+                          aliases.clear();
+                          aliases.addAll(updated);
+                        });
+                      }
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              const Text('Active Shortcuts:', style: TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 180),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: aliases.length,
+                  itemBuilder: (ctx, i) {
+                    final item = aliases[i];
+                    return ListTile(
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.bolt, color: Color(0xFF00E5CC), size: 18),
+                      title: Text(item['trigger_phrase'] as String, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                      subtitle: Text("→ ${item['target_value']}", style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.delete_outline, size: 18, color: Colors.white38),
+                        onPressed: () async {
+                          await DatabaseHelper.instance.deleteAlias(item['id'] as int);
+                          final updated = await DatabaseHelper.instance.getAliases();
+                          setModalState(() {
+                            aliases.clear();
+                            aliases.addAll(updated);
+                          });
+                        },
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
   void _showSnack(String msg) {
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(msg), behavior: SnackBarBehavior.floating),
-      );
-    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  //  Build
+  //  UI Build
   // ─────────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF07070E),
-      floatingActionButton: _buildDebugFab(),
       body: SafeArea(
         child: CustomScrollView(
           physics: const BouncingScrollPhysics(),
@@ -499,12 +664,23 @@ class _DashboardScreenState extends State<DashboardScreen>
               ),
               actions: [
                 IconButton(
-                  tooltip: 'Open chat',
-                  icon: const Icon(Icons.chat_bubble_outline_rounded),
-                  onPressed: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => ChatScreen(backendWs: _backendWs))),
+                  tooltip: 'Open Siri Floating Orb',
+                  icon: const Icon(Icons.assistant_outlined, color: Color(0xFF00E5CC)),
+                  onPressed: _openSiriOverlay,
+                ),
+                IconButton(
+                  tooltip: 'Custom Shortcuts',
+                  icon: const Icon(Icons.bolt_rounded, color: Colors.amber),
+                  onPressed: _openAliasesDialog,
+                ),
+                IconButton(
+                  tooltip: 'Gemini API Key',
+                  icon: const Icon(Icons.vpn_key_outlined),
+                  onPressed: _openApiKeyDialog,
                 ),
                 if (_serviceRunning)
                   IconButton(
+                    tooltip: 'Stop Background Service',
                     icon: const Icon(Icons.stop_circle_outlined, color: Color(0xFFEF5350)),
                     onPressed: _stopService,
                   ),
@@ -519,13 +695,12 @@ class _DashboardScreenState extends State<DashboardScreen>
                   _StateChip(state: _assistantState),
                   const SizedBox(height: 28),
 
-                  // PHASE 1: Isolated repaint for the orb center
                   Center(child: RepaintBoundary(child: _buildOrb())),
 
                   const SizedBox(height: 12),
                   Center(
                     child: Text(
-                      _serviceRunning ? 'Say "Hey Bro" anytime' : 'Tap orb to start',
+                      _serviceRunning ? 'Say "Hey Bro" or tap orb' : 'Tap orb to start',
                       style: TextStyle(fontSize: 12, color: Colors.white.withValues(alpha: 0.35)),
                     ),
                   ),
@@ -550,7 +725,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                         children: [
                           Icon(_wsConnected ? Icons.cloud_done_rounded : Icons.cloud_off_rounded, size: 12, color: _wsConnected ? const Color(0xFF00E5CC) : Colors.white24),
                           const SizedBox(width: 4),
-                          Text(_backendLabel, style: const TextStyle(fontSize: 11, color: Colors.white24)),
+                          Text(_backendWs.contains('googleapis') ? 'Gemini 3.8 Live' : 'Custom Backend', style: const TextStyle(fontSize: 11, color: Colors.white24)),
                         ],
                       ),
                     ),
@@ -566,56 +741,32 @@ class _DashboardScreenState extends State<DashboardScreen>
                   ],
 
                   if (_history.isNotEmpty) ...[
-                    const _SectionHeader(title: 'Recent', icon: Icons.chat_bubble_outline_rounded),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const _SectionHeader(title: 'Memory (SQLite)', icon: Icons.history_rounded),
+                        TextButton(
+                          onPressed: () async {
+                            await DatabaseHelper.instance.clearConversations();
+                            setState(() => _history.clear());
+                          },
+                          child: const Text('Clear', style: TextStyle(fontSize: 12, color: Colors.white38)),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 10),
-                    ..._history.take(6).map((e) => _ExchangeCard(exchange: e)),
-                    const SizedBox(height: 24),
+                    ..._history.map((e) => _ExchangeCard(exchange: e)),
+                    const SizedBox(height: 28),
                   ],
 
                   const _SectionHeader(title: 'Permissions', icon: Icons.security_rounded),
                   const SizedBox(height: 10),
+
                   _PermTile(title: 'Microphone', icon: Icons.mic_rounded, granted: _hasMic, onFix: () => _platform.invokeMethod('requestMicPermission')),
-                  _PermTile(title: 'Accessibility', icon: Icons.accessibility_new_rounded, granted: _hasA11y, onFix: () => _platform.invokeMethod('requestAccessibilityPermission')),
-                  _PermTile(title: 'Overlay', icon: Icons.picture_in_picture_rounded, granted: _hasOverlay, onFix: () => _platform.invokeMethod('requestOverlayPermission')),
-                  _PermTile(
-                    title: 'Calls, contacts and SMS',
-                    icon: Icons.phone_android_rounded,
-                    granted: _hasPhone && _hasContacts && _hasReadSms && _hasSendSms,
-                    onFix: () async {
-                      await _platform.invokeMethod('requestCommunicationPermissions');
-                      _checkPermissions();
-                    },
-                  ),
-                  _PermTile(
-                    title: 'Notification access',
-                    icon: Icons.notifications_active_rounded,
-                    granted: _hasNotificationAccess,
-                    onFix: () async {
-                      await _platform.invokeMethod('requestNotificationAccess');
-                      _checkPermissions();
-                    },
-                  ),
-
-                  const SizedBox(height: 16),
-                  const _SectionHeader(title: 'Backend', icon: Icons.dns_rounded),
-                  const SizedBox(height: 10),
-                  _BackendTile(label: _backendLabel, connected: _wsConnected, onTap: _pickServer),
-
-                  Container(
-                    margin: const EdgeInsets.only(bottom: 10),
-                    decoration: BoxDecoration(color: const Color(0xFF111118), borderRadius: BorderRadius.circular(14), border: Border.all(color: Colors.white10)),
-                    child: Material(
-                      color: Colors.transparent,
-                      borderRadius: BorderRadius.circular(14),
-                      clipBehavior: Clip.antiAlias,
-                      child: SwitchListTile(
-                        title: const Text('Auto-start on boot', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
-                        value: _autostart,
-                        activeThumbColor: const Color(0xFF00E5CC),
-                        onChanged: _toggleAutostart,
-                      ),
-                    ),
-                  ),
+                  _PermTile(title: 'Accessibility Service', icon: Icons.accessibility_new_rounded, granted: _hasA11y, onFix: () => _platform.invokeMethod('openAccessibilitySettings')),
+                  _PermTile(title: 'Draw Over Other Apps', icon: Icons.layers_rounded, granted: _hasOverlay, onFix: () => _platform.invokeMethod('requestOverlayPermission')),
+                  _PermTile(title: 'Notifications Access', icon: Icons.notifications_rounded, granted: _hasNotificationAccess, onFix: () => _platform.invokeMethod('openNotificationListenerSettings')),
+                  _PermTile(title: 'Battery Optimization', icon: Icons.battery_charging_full_rounded, granted: _hasBattery, onFix: () => _platform.invokeMethod('requestBatteryExemption')),
 
                   const SizedBox(height: 40),
                 ]),
@@ -628,72 +779,70 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 
   Widget _buildOrb() {
-    final color    = _assistantState.color;
-    final isActive = _serviceRunning;
-    final isListening = isActive && _assistantState == AssistantState.listening;
+    final color = _assistantState.color;
+    final isListening = _assistantState == AssistantState.listening;
+    final isPlaying   = _assistantState == AssistantState.playing;
+    final animActive  = isListening || isPlaying;
 
     return GestureDetector(
       onTap: _toggleService,
-      onLongPress: _stopService,
       child: SizedBox(
-        width: 200,
-        height: 200,
+        width: 170,
+        height: 170,
         child: Stack(
           alignment: Alignment.center,
           children: [
-            // PHASE 1: Isolated RepaintBoundary for wave rings
-            TickerMode(
-              enabled: isListening,
-              child: RepaintBoundary(
-                child: AnimatedBuilder(
-                  animation: _waveCtrl,
-                  builder: (context, _) {
-                    return CustomPaint(
-                      size: const Size(200, 200),
-                      painter: _WaveRingPainter(_waveCtrl.value, color),
-                    );
-                  },
+            if (animActive) ...[
+              AnimatedBuilder(
+                animation: _waveCtrl,
+                builder: (ctx, child) => CustomPaint(
+                  size: const Size(170, 170),
+                  painter: _WaveRingPainter(progress: _waveCtrl.value, color: color),
                 ),
               ),
-            ),
-
-            // PHASE 1: Isolated RepaintBoundary for pulsing orb
-            TickerMode(
-              enabled: isActive && (_assistantState == AssistantState.listening || _assistantState == AssistantState.playing),
-              child: RepaintBoundary(
-                child: AnimatedBuilder(
-                  animation: _pulseAnim,
-                  builder: (context, child) {
-                    final scale = isListening ? _pulseAnim.value : 1.0;
-                    return Transform.scale(scale: scale, child: child);
-                  },
-                  child: Container(
-                    width: 160,
-                    height: 160,
-                    decoration: BoxDecoration(
-                      shape: BoxShape.circle,
-                      gradient: RadialGradient(
-                        colors: isActive
-                            ? [color.withValues(alpha: 0.8), color.withValues(alpha: 0.1)]
-                            : [const Color(0xFF1C1C26), const Color(0xFF111118)],
-                        stops: const [0.0, 1.0],
-                        radius: 0.9,
-                      ),
-                      boxShadow: isActive
-                          ? [BoxShadow(color: color.withValues(alpha: 0.3), blurRadius: 30, spreadRadius: 5)]
-                          : [],
-                    ),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(isActive ? _assistantState.icon : Icons.mic_none_rounded, size: 60, color: isActive ? Colors.white : Colors.white24),
-                        const SizedBox(height: 6),
-                        Text(isActive ? _assistantState.label : 'Tap to Start', style: const TextStyle(fontSize: 12, color: Colors.white, fontWeight: FontWeight.w600)),
+              AnimatedBuilder(
+                animation: _waveCtrl,
+                builder: (ctx, child) => CustomPaint(
+                  size: const Size(170, 170),
+                  painter: _WaveRingPainter(progress: (_waveCtrl.value + 0.5) % 1.0, color: color),
+                ),
+              ),
+            ],
+            AnimatedBuilder(
+              animation: _pulseAnim,
+              builder: (ctx, child) => Transform.scale(
+                scale: animActive ? _pulseAnim.value : 1.0,
+                child: Container(
+                  width: 120,
+                  height: 120,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    gradient: RadialGradient(
+                      colors: [
+                        color.withValues(alpha: 0.35),
+                        color.withValues(alpha: 0.1),
+                        Colors.transparent,
                       ],
                     ),
                   ),
                 ),
               ),
+            ),
+            Container(
+              width: 84,
+              height: 84,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [color, color.withValues(alpha: 0.65)],
+                ),
+                boxShadow: [
+                  BoxShadow(color: color.withValues(alpha: 0.45), blurRadius: 28, spreadRadius: 4),
+                ],
+              ),
+              child: Icon(_assistantState.icon, size: 36, color: Colors.black87),
             ),
           ],
         ),
@@ -702,131 +851,27 @@ class _DashboardScreenState extends State<DashboardScreen>
   }
 }
 
-class ChatScreen extends StatefulWidget {
-  final String backendWs;
-  const ChatScreen({super.key, required this.backendWs});
-
-  @override
-  State<ChatScreen> createState() => _ChatScreenState();
-}
-
-class _ChatScreenState extends State<ChatScreen> {
-  final _input = TextEditingController();
-  final _scroll = ScrollController();
-  final List<Map<String, String>> _messages = [];
-  String _provider = 'groq';
-  String _model = 'llama-3.3-70b-versatile';
-  bool _sending = false;
-
-  static const _models = <String, List<String>>{
-    'groq': ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
-    'gemini': ['gemini-1.5-flash', 'gemini-1.5-pro'],
-    'deepseek': ['deepseek-chat', 'deepseek-reasoner'],
-  };
-
-  @override
-  void dispose() {
-    _input.dispose();
-    _scroll.dispose();
-    super.dispose();
-  }
-
-  String get _chatUrl {
-    final base = widget.backendWs
-        .replaceFirst(RegExp(r'^wss://'), 'https://')
-        .replaceFirst(RegExp(r'^ws://'), 'http://');
-    return base.replaceFirst('/ws/audio', '/chat');
-  }
-
-  Future<void> _send() async {
-    final message = _input.text.trim();
-    if (message.isEmpty || _sending) return;
-    _input.clear();
-    setState(() {
-      _sending = true;
-      _messages.add({'role': 'user', 'text': message});
-    });
-    try {
-      final history = _messages
-          .where((item) => item['role'] == 'user' || item['role'] == 'assistant')
-          .toList()
-          .map((item) => {'user': item['role'] == 'user' ? item['text']! : '', 'assistant': item['role'] == 'assistant' ? item['text']! : ''})
-          .toList();
-      final response = await http.post(
-        Uri.parse(_chatUrl),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'message': message, 'provider': _provider, 'model': _model, 'history': history}),
-      ).timeout(const Duration(seconds: 65));
-      final data = jsonDecode(response.body) as Map<String, dynamic>;
-      if (response.statusCode < 200 || response.statusCode >= 300 || data['error'] != null) {
-        throw Exception(data['error'] ?? 'Chat request failed (${response.statusCode})');
-      }
-      if (data['type'] == 'ACTION' && data['action'] is String) {
-        final params = Map<String, dynamic>.from((data['params'] as Map?) ?? const {});
-        final actionPayload = <String, dynamic>{'action': data['action'], ...params};
-        await const MethodChannel('com.example.hey_bro/assistant').invokeMethod(
-          'executeAssistantAction',
-          {'payload': jsonEncode(actionPayload)},
-        );
-      }
-      setState(() => _messages.add({'role': 'assistant', 'text': '${data['reply']}'}));
-    } catch (error) {
-      setState(() => _messages.add({'role': 'assistant', 'text': 'Chat unavailable: $error'}));
-    } finally {
-      if (mounted) {
-        setState(() => _sending = false);
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scroll.hasClients) _scroll.animateTo(_scroll.position.maxScrollExtent, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
-        });
-      }
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final choices = _models[_provider]!;
-    if (!choices.contains(_model)) _model = choices.first;
-    return Scaffold(
-      appBar: AppBar(title: const Text('Hey Bro Chat')),
-      body: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
-            child: Row(children: [
-              Expanded(child: DropdownButtonFormField<String>(isExpanded: true, initialValue: _provider, decoration: const InputDecoration(labelText: 'Provider'), items: const [DropdownMenuItem(value: 'groq', child: Text('Groq')), DropdownMenuItem(value: 'gemini', child: Text('Gemini')), DropdownMenuItem(value: 'deepseek', child: Text('DeepSeek'))], onChanged: _sending ? null : (value) => setState(() { _provider = value!; _model = _models[value]!.first; }))),
-              const SizedBox(width: 12),
-              Expanded(child: DropdownButtonFormField<String>(isExpanded: true, initialValue: _model, decoration: const InputDecoration(labelText: 'Model'), items: choices.map((model) => DropdownMenuItem(value: model, child: Text(model, overflow: TextOverflow.ellipsis))).toList(), onChanged: _sending ? null : (value) => setState(() => _model = value!))),
-            ]),
-          ),
-          Expanded(child: ListView.builder(controller: _scroll, padding: const EdgeInsets.all(16), itemCount: _messages.length, itemBuilder: (_, index) {
-            final item = _messages[index];
-            final isUser = item['role'] == 'user';
-            return Align(alignment: isUser ? Alignment.centerRight : Alignment.centerLeft, child: Container(margin: const EdgeInsets.only(bottom: 10), padding: const EdgeInsets.all(12), constraints: const BoxConstraints(maxWidth: 330), decoration: BoxDecoration(color: isUser ? const Color(0xFF00695C) : const Color(0xFF1C1C26), borderRadius: BorderRadius.circular(14)), child: Text(item['text'] ?? '')));
-          }),),
-          SafeArea(child: Padding(padding: const EdgeInsets.fromLTRB(12, 4, 12, 12), child: Row(children: [Expanded(child: TextField(controller: _input, enabled: !_sending, textInputAction: TextInputAction.send, onSubmitted: (_) => _send(), decoration: const InputDecoration(hintText: 'Ask anything'))), const SizedBox(width: 8), IconButton(tooltip: 'Send message', onPressed: _sending ? null : _send, icon: _sending ? const SizedBox(width: 20, height: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.send_rounded))]))),
-        ],
-      ),
-    );
-  }
-}
+// ─────────────────────────────────────────────────────────────────────────────
+//  UI Component Widgets
+// ─────────────────────────────────────────────────────────────────────────────
 
 class _WaveRingPainter extends CustomPainter {
   final double progress;
-  final Color color;
-  final Paint _paint = Paint()..style = PaintingStyle.stroke..strokeWidth = 1.5;
-
-  _WaveRingPainter(this.progress, this.color);
+  final Color  color;
+  _WaveRingPainter({required this.progress, required this.color});
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    for (int i = 0; i < 3; i++) {
-      final phase   = (progress + i * 0.33) % 1.0;
-      final radius  = 80.0 + phase * 20.0;
-      final opacity = (1 - phase) * 0.3;
-      _paint.color = color.withValues(alpha: opacity);
-      canvas.drawCircle(center, radius, _paint);
-    }
+    final radius = 42.0 + progress * 40.0;
+    final alpha  = (1.0 - progress).clamp(0.0, 1.0) * 0.5;
+
+    final paint = Paint()
+      ..color       = color.withValues(alpha: alpha)
+      ..style       = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+
+    canvas.drawCircle(center, radius, paint);
   }
 
   @override
@@ -880,8 +925,7 @@ class _GlowDotState extends State<_GlowDot> with SingleTickerProviderStateMixin 
   void initState() { super.initState(); _sync(); }
   @override
   void didUpdateWidget(_GlowDot old) { super.didUpdateWidget(old); if (old.active != widget.active) _sync(); }
-  
-  // PHASE 1: strictly control ticker for the glow dot
+
   void _sync() { if (widget.active) { if (!_ctrl.isAnimating) _ctrl.repeat(reverse: true); } else { _ctrl.stop(); _ctrl.value = 0; } }
 
   @override
@@ -950,32 +994,6 @@ class _PermTile extends StatelessWidget {
           leading: Icon(icon, color: statusColor, size: 18),
           title: Text(title, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
           trailing: granted ? Icon(Icons.check_circle_rounded, color: statusColor, size: 22) : FilledButton.tonal(onPressed: onFix, child: const Text('Grant')),
-        ),
-      ),
-    );
-  }
-}
-
-class _BackendTile extends StatelessWidget {
-  final String label; final bool connected; final VoidCallback onTap;
-  const _BackendTile({required this.label, required this.connected, required this.onTap});
-  @override
-  Widget build(BuildContext context) {
-    final statusColor = connected ? const Color(0xFF00E5CC) : Colors.white24;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 8),
-      decoration: BoxDecoration(color: const Color(0xFF111118), borderRadius: BorderRadius.circular(14), border: Border.all(color: statusColor.withValues(alpha: 0.2))),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(14),
-        clipBehavior: Clip.antiAlias,
-        child: InkWell(
-          onTap: onTap,
-          child: ListTile(
-            leading: Icon(connected ? Icons.cloud_done_rounded : Icons.cloud_off_rounded, color: statusColor, size: 18),
-            title: Text(label, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14)),
-            trailing: const Icon(Icons.arrow_forward_rounded, size: 20, color: Colors.white24),
-          ),
         ),
       ),
     );

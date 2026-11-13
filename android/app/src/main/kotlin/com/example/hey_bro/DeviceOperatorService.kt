@@ -79,6 +79,30 @@ class DeviceOperatorService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
+    fun extractScreenText(): String {
+        val root = rootInActiveWindow ?: return ""
+        val sb = StringBuilder()
+        fun traverse(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            val text = node.text?.toString()?.trim()
+            val desc = node.contentDescription?.toString()?.trim()
+            if (!text.isNullOrBlank()) {
+                sb.append(text).append(" ")
+            } else if (!desc.isNullOrBlank()) {
+                sb.append(desc).append(" ")
+            }
+            for (i in 0 until node.childCount) {
+                traverse(node.getChild(i))
+            }
+        }
+        try {
+            traverse(root)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error extracting screen text: ${e.message}")
+        }
+        return sb.toString().trim().take(1500)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Main dispatch
     // ─────────────────────────────────────────────────────────────────────────
@@ -128,8 +152,17 @@ class DeviceOperatorService : AccessibilityService() {
             }
 
             if (isDeviceLocked() && !isLockscreenSafeAction(action)) {
-                Log.w(TAG, "Blocked unlocked-only action while device is locked: $action")
-                return
+                Log.i(TAG, "Device locked – requesting keyguard dismissal for action: $action")
+                try {
+                    val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
+                    MainActivity.activeActivity?.let { activity ->
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            km?.requestDismissKeyguard(activity, null)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to request keyguard dismissal: ${e.message}")
+                }
             }
 
             if (executeExtendedOperation(action, json)) return

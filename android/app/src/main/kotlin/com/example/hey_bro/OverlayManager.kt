@@ -34,6 +34,8 @@ class OverlayManager(private val context: Context) {
     private var statusIcon:  ImageView? = null
     private var isShowing    = false
     private var hideRunnable: Runnable? = null
+    private var cachedLayoutParams: WindowManager.LayoutParams? = null
+    private var cachedBackground: GradientDrawable? = null
 
     enum class State { LISTENING, PROCESSING, PLAYING }
 
@@ -62,6 +64,8 @@ class OverlayManager(private val context: Context) {
         overlayView = null
         statusText  = null
         statusIcon  = null
+        cachedLayoutParams = null
+        cachedBackground = null
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -81,26 +85,29 @@ class OverlayManager(private val context: Context) {
             State.PLAYING    -> Triple(android.R.drawable.ic_media_play,       0xFF1565C0.toInt(), label.ifBlank { "Playing…"    })
         }
 
-        // Update pill background color
-        val bg = GradientDrawable().apply {
+        // Reuse cached GradientDrawable instead of creating a new one every time
+        val bg = cachedBackground ?: GradientDrawable().apply {
             shape   = GradientDrawable.RECTANGLE
             cornerRadius = 200f
-            setColor(bgColor)
-        }
+        }.also { cachedBackground = it }
+        bg.setColor(bgColor)
         overlayView?.background = bg
         statusIcon?.setImageResource(iconRes)
         statusText?.text = text
 
+        // Reuse cached LayoutParams
+        val params = cachedLayoutParams ?: buildLayoutParams().also { cachedLayoutParams = it }
+
         if (!isShowing) {
             try {
-                windowManager.addView(overlayView, buildLayoutParams())
+                windowManager.addView(overlayView, params)
                 isShowing = true
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to add overlay: ${e.message}")
             }
         } else {
             try {
-                windowManager.updateViewLayout(overlayView, buildLayoutParams())
+                windowManager.updateViewLayout(overlayView, params)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to update overlay: ${e.message}")
             }
@@ -159,7 +166,9 @@ class OverlayManager(private val context: Context) {
             type,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
             PixelFormat.TRANSLUCENT
         ).also {
             it.gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL

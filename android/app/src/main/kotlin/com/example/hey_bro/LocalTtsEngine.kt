@@ -39,7 +39,7 @@ class LocalTtsEngine(private val context: Context) {
                 }
 
                 configureDeepMaleVoice()
-                tts?.setSpeechRate(0.9f)
+                tts?.setSpeechRate(1.05f)
                 tts?.setPitch(0.72f)
 
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
@@ -67,6 +67,13 @@ class LocalTtsEngine(private val context: Context) {
 
                 isReady = true
                 Log.i(TAG, "LocalTtsEngine ready")
+
+                // Pre-warm TTS engine to avoid 200-400ms cold-start on first real utterance
+                val warmupId = "__warmup__"
+                val warmupParams = Bundle().apply {
+                    putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 0f)
+                }
+                tts?.speak("", TextToSpeech.QUEUE_ADD, warmupParams, warmupId)
             } else {
                 Log.e(TAG, "TTS initialization failed with status $status")
             }
