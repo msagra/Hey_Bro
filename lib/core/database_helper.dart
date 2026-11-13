@@ -31,38 +31,38 @@ class DatabaseHelper {
   }
 
   static const List<Map<String, String>> defaultShortcuts = [
-    {'trigger_phrase': 'torch', 'target_type': 'action', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'turn on flashlight', 'target_type': 'action', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'turn off flashlight', 'target_type': 'action', 'target_value': 'flashlightOff'},
-    {'trigger_phrase': 'torch off', 'target_type': 'action', 'target_value': 'flashlightOff'},
-    {'trigger_phrase': 'silence phone', 'target_type': 'action', 'target_value': 'mute'},
-    {'trigger_phrase': 'mute', 'target_type': 'action', 'target_value': 'mute'},
-    {'trigger_phrase': 'volume up', 'target_type': 'action', 'target_value': 'volumeUp'},
-    {'trigger_phrase': 'volume down', 'target_type': 'action', 'target_value': 'volumeDown'},
-    {'trigger_phrase': 'take a selfie', 'target_type': 'action', 'target_value': 'takeSelfie'},
-    {'trigger_phrase': 'front camera', 'target_type': 'action', 'target_value': 'takeSelfie'},
-    {'trigger_phrase': 'take photo', 'target_type': 'action', 'target_value': 'takePhoto'},
-    {'trigger_phrase': 'open camera', 'target_type': 'action', 'target_value': 'openCamera'},
-    {'trigger_phrase': 'screenshot', 'target_type': 'action', 'target_value': 'screenshot'},
-    {'trigger_phrase': 'take screenshot', 'target_type': 'action', 'target_value': 'screenshot'},
-    {'trigger_phrase': 'lock screen', 'target_type': 'action', 'target_value': 'lockScreen'},
-    {'trigger_phrase': 'battery saver', 'target_type': 'action', 'target_value': 'batterySaver'},
-    {'trigger_phrase': 'do not disturb', 'target_type': 'action', 'target_value': 'doNotDisturb'},
-    {'trigger_phrase': 'show notifications', 'target_type': 'action', 'target_value': 'notifications'},
-    {'trigger_phrase': 'quick settings', 'target_type': 'action', 'target_value': 'quickSettings'},
-    {'trigger_phrase': 'recent apps', 'target_type': 'action', 'target_value': 'recents'},
-    {'trigger_phrase': 'go home', 'target_type': 'action', 'target_value': 'globalHome'},
-    {'trigger_phrase': 'go back', 'target_type': 'action', 'target_value': 'globalBack'},
-    {'trigger_phrase': 'pause music', 'target_type': 'action', 'target_value': 'mediaPlayPause'},
-    {'trigger_phrase': 'next song', 'target_type': 'action', 'target_value': 'mediaNext'},
-    {'trigger_phrase': 'previous song', 'target_type': 'action', 'target_value': 'mediaPrevious'},
-    {'trigger_phrase': 'turn on wifi', 'target_type': 'action', 'target_value': 'toggleWifi'},
-    {'trigger_phrase': 'turn on bluetooth', 'target_type': 'action', 'target_value': 'toggleBluetooth'},
-    {'trigger_phrase': 'turn on hotspot', 'target_type': 'action', 'target_value': 'toggleHotspot'},
-    {'trigger_phrase': 'open maps', 'target_type': 'action', 'target_value': 'openMaps'},
-    {'trigger_phrase': 'open whatsapp', 'target_type': 'action', 'target_value': 'openApp:com.whatsapp'},
-    {'trigger_phrase': 'open youtube', 'target_type': 'action', 'target_value': 'openApp:com.google.android.youtube'},
-    {'trigger_phrase': 'open spotify', 'target_type': 'action', 'target_value': 'openApp:com.spotify.music'},
+    {'trigger_phrase': 'torch', 'target_type': 'system', 'target_value': 'flashlightOn'},
+    {'trigger_phrase': 'turn on flashlight', 'target_type': 'system', 'target_value': 'flashlightOn'},
+    {'trigger_phrase': 'turn off flashlight', 'target_type': 'system', 'target_value': 'flashlightOff'},
+    {'trigger_phrase': 'torch off', 'target_type': 'system', 'target_value': 'flashlightOff'},
+    {'trigger_phrase': 'silence phone', 'target_type': 'system', 'target_value': 'mute'},
+    {'trigger_phrase': 'mute', 'target_type': 'system', 'target_value': 'mute'},
+    {'trigger_phrase': 'volume up', 'target_type': 'system', 'target_value': 'volumeUp'},
+    {'trigger_phrase': 'volume down', 'target_type': 'system', 'target_value': 'volumeDown'},
+    {'trigger_phrase': 'take a selfie', 'target_type': 'system', 'target_value': 'takeSelfie'},
+    {'trigger_phrase': 'front camera', 'target_type': 'system', 'target_value': 'takeSelfie'},
+    {'trigger_phrase': 'take photo', 'target_type': 'system', 'target_value': 'takePhoto'},
+    {'trigger_phrase': 'open camera', 'target_type': 'system', 'target_value': 'openCamera'},
+    {'trigger_phrase': 'screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
+    {'trigger_phrase': 'take screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
+    {'trigger_phrase': 'lock screen', 'target_type': 'system', 'target_value': 'lockScreen'},
+    {'trigger_phrase': 'battery saver', 'target_type': 'system', 'target_value': 'batterySaver'},
+    {'trigger_phrase': 'do not disturb', 'target_type': 'system', 'target_value': 'doNotDisturb'},
+    {'trigger_phrase': 'show notifications', 'target_type': 'system', 'target_value': 'notifications'},
+    {'trigger_phrase': 'quick settings', 'target_type': 'system', 'target_value': 'quickSettings'},
+    {'trigger_phrase': 'recent apps', 'target_type': 'system', 'target_value': 'recents'},
+    {'trigger_phrase': 'go home', 'target_type': 'system', 'target_value': 'globalHome'},
+    {'trigger_phrase': 'go back', 'target_type': 'system', 'target_value': 'globalBack'},
+    {'trigger_phrase': 'pause music', 'target_type': 'system', 'target_value': 'mediaPlayPause'},
+    {'trigger_phrase': 'next song', 'target_type': 'system', 'target_value': 'mediaNext'},
+    {'trigger_phrase': 'previous song', 'target_type': 'system', 'target_value': 'mediaPrevious'},
+    {'trigger_phrase': 'turn on wifi', 'target_type': 'system', 'target_value': 'toggleWifi'},
+    {'trigger_phrase': 'turn on bluetooth', 'target_type': 'system', 'target_value': 'toggleBluetooth'},
+    {'trigger_phrase': 'turn on hotspot', 'target_type': 'system', 'target_value': 'toggleHotspot'},
+    {'trigger_phrase': 'open maps', 'target_type': 'system', 'target_value': 'openMaps'},
+    {'trigger_phrase': 'open whatsapp', 'target_type': 'system', 'target_value': 'openApp:com.whatsapp'},
+    {'trigger_phrase': 'open youtube', 'target_type': 'system', 'target_value': 'openApp:com.google.android.youtube'},
+    {'trigger_phrase': 'open spotify', 'target_type': 'system', 'target_value': 'openApp:com.spotify.music'},
   ];
 
   Future<Database> _initDatabase() async {
@@ -117,6 +117,12 @@ class DatabaseHelper {
 
   Future<void> _ensureDefaultShortcuts(Database db) async {
     for (final shortcut in defaultShortcuts) {
+      await db.update(
+        'custom_aliases',
+        {'target_type': 'system'},
+        where: 'trigger_phrase = ? AND target_type != ?',
+        whereArgs: [shortcut['trigger_phrase'], 'custom'],
+      );
       await db.insert(
         'custom_aliases',
         shortcut,
@@ -155,20 +161,36 @@ class DatabaseHelper {
 
   Future<int> insertAlias(String triggerPhrase, String targetType, String targetValue) async {
     final db = await database;
+    final type = targetType.trim().isEmpty ? 'custom' : targetType.trim();
     return await db.insert(
       'custom_aliases',
       {
         'trigger_phrase': triggerPhrase.trim().toLowerCase(),
-        'target_type': targetType.trim(),
+        'target_type': type,
         'target_value': targetValue.trim(),
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
   }
 
-  Future<List<Map<String, dynamic>>> getAliases() async {
+  Future<List<Map<String, dynamic>>> getAliases({bool customFirst = true}) async {
     final db = await database;
+    if (customFirst) {
+      return await db.query(
+        'custom_aliases',
+        orderBy: "CASE WHEN target_type = 'custom' THEN 0 ELSE 1 END, id DESC",
+      );
+    }
     return await db.query('custom_aliases', orderBy: 'trigger_phrase ASC');
+  }
+
+  Future<List<Map<String, dynamic>>> getCustomOnlyAliases() async {
+    final db = await database;
+    return await db.query(
+      'custom_aliases',
+      where: "target_type = 'custom'",
+      orderBy: 'id DESC',
+    );
   }
 
   Future<Map<String, dynamic>?> findAlias(String phrase) async {

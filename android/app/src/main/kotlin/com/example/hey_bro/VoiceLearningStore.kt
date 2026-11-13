@@ -66,11 +66,11 @@ object VoiceLearningStore {
 
     fun learn(transcript: String, action: String) {
         val normalized = normalize(transcript)
-        val baseAction = if (action.startsWith("openApp:")) "openApp" else action
-        if (normalized.isBlank() || baseAction !in supportedActions) return
+        val baseAction = if (action.startsWith("openApp:")) "openApp" else action.split(":").first()
+        if (normalized.isBlank() || (baseAction !in supportedActions && !action.contains(":"))) return
         val current = loadMap().toMutableMap()
         current[normalized] = action
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current).toString())?.apply()
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
         Log.d(TAG, "Learned alias: '$normalized' -> '$action'")
     }
 
@@ -79,13 +79,35 @@ object VoiceLearningStore {
         val current = loadMap().toMutableMap()
         for ((phrase, action) in entries) {
             val normalized = normalize(phrase)
-            val baseAction = if (action.startsWith("openApp:")) "openApp" else action
-            if (normalized.isNotBlank() && baseAction in supportedActions) {
+            val baseAction = if (action.startsWith("openApp:")) "openApp" else action.split(":").first()
+            if (normalized.isNotBlank() && (baseAction in supportedActions || action.contains(":"))) {
                 current[normalized] = action
             }
         }
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current).toString())?.apply()
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
         Log.d(TAG, "Learned batch of ${entries.size} aliases")
+    }
+
+    fun remove(transcript: String) {
+        val normalized = normalize(transcript)
+        val current = loadMap().toMutableMap()
+        if (current.remove(normalized) != null) {
+            prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
+            Log.d(TAG, "Removed alias: '$normalized'")
+        }
+    }
+
+    fun replaceAll(entries: Map<String, String>) {
+        val current = linkedMapOf<String, String>()
+        for ((phrase, action) in entries) {
+            val normalized = normalize(phrase)
+            val baseAction = if (action.startsWith("openApp:")) "openApp" else action.split(":").first()
+            if (normalized.isNotBlank() && (baseAction in supportedActions || action.contains(":"))) {
+                current[normalized] = action
+            }
+        }
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
+        Log.d(TAG, "Replaced all learned aliases (${current.size} entries)")
     }
 
     fun findActionForTranscript(transcript: String): String? {

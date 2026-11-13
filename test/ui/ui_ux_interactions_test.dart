@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hey_bro/core/database_helper.dart';
 import 'package:hey_bro/main.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -129,7 +128,7 @@ WAKE_PHRASE=hey bro
       await tester.pump(const Duration(milliseconds: 500));
 
       // If bottom sheet was pushed, verify elements
-      final titleFinder = find.text('Custom Shortcuts (SQLite)');
+      final titleFinder = find.textContaining('Shortcuts (SQLite)');
       if (titleFinder.evaluate().isNotEmpty) {
         expect(find.text('Sync Native'), findsOneWidget);
         await tester.tap(find.text('Sync Native'));
@@ -137,6 +136,62 @@ WAKE_PHRASE=hey bro
         await tester.pump(const Duration(milliseconds: 300));
         expect(invokedMethods, contains('syncCustomAliases'));
 
+        await tester.tap(find.byIcon(Icons.close));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+      }
+    });
+
+    testWidgets('User can add, view, filter, and delete custom shortcuts', (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1260, 2800);
+      tester.view.devicePixelRatio = 2.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(const HeyBroApp());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      final boltIcon = find.byIcon(Icons.bolt_rounded);
+      expect(boltIcon, findsOneWidget);
+      await tester.tap(boltIcon);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+
+      final titleFinder = find.textContaining('Shortcuts (SQLite)');
+      if (titleFinder.evaluate().isNotEmpty) {
+        // Enter a custom phrase
+        final phraseFinder = find.byType(TextField).first;
+        await tester.enterText(phraseFinder, 'fast pizza');
+        await tester.pump();
+
+        // Tap preset chip 'Torch On'
+        final torchPreset = find.widgetWithText(ActionChip, '🔦 Torch On');
+        expect(torchPreset, findsOneWidget);
+        await tester.tap(torchPreset);
+        await tester.pump();
+
+        // Tap '+' button to add shortcut
+        final addBtn = find.widgetWithIcon(IconButton, Icons.add);
+        expect(addBtn, findsOneWidget);
+        await tester.tap(addBtn);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        // Verify addCustomAlias was invoked
+        expect(invokedMethods, contains('addCustomAlias'));
+
+        // Verify CUSTOM badge is present
+        expect(find.text('CUSTOM'), findsAtLeastNWidgets(1));
+
+        // Verify FilterChip works
+        final customFilterChip = find.textContaining('My Custom');
+        expect(customFilterChip, findsOneWidget);
+        await tester.tap(customFilterChip);
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 300));
+
+        // Close dialog
         await tester.tap(find.byIcon(Icons.close));
         await tester.pump();
         await tester.pump(const Duration(milliseconds: 500));

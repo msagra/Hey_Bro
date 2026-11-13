@@ -42,12 +42,21 @@ void main() {
     test('Insert and delete custom shortcut alias', () async {
       final db = DatabaseHelper.instance;
 
-      final id = await db.insertAlias('order pizza', 'action', 'openApp:com.dominos');
+      final id = await db.insertAlias('order pizza', 'custom', 'openApp:com.dominos');
       expect(id, isPositive);
 
       final found = await db.findAlias('order pizza');
       expect(found, isNotNull);
       expect(found!['target_value'], equals('openApp:com.dominos'));
+
+      // Verify custom shortcut appears at the very top of getAliases
+      final allWithCustom = await db.getAliases();
+      expect(allWithCustom.first['trigger_phrase'], equals('order pizza'));
+      expect(allWithCustom.first['target_type'], equals('custom'));
+
+      // Verify getCustomOnlyAliases returns custom shortcut
+      final customOnly = await db.getCustomOnlyAliases();
+      expect(customOnly.any((a) => a['trigger_phrase'] == 'order pizza'), isTrue);
 
       final deleted = await db.deleteAlias(id);
       expect(deleted, equals(1));

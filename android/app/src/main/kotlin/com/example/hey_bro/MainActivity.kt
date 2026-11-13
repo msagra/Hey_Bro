@@ -64,6 +64,10 @@ class MainActivity : FlutterActivity() {
     override fun onResume() {
         super.onResume()
         activeActivity = this
+        try {
+            val json = org.json.JSONObject(mapOf("type" to "permissions_updated")).toString()
+            CoreVoiceService.eventSink?.success(json)
+        } catch (_: Exception) {}
     }
 
     override fun onPause() {
@@ -180,6 +184,18 @@ class MainActivity : FlutterActivity() {
                         requestBatteryExemption()
                         result.success(true)
                     }
+                    "openAppSettings" -> {
+                        try {
+                            val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                data = Uri.fromParts("package", packageName, null)
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            startActivity(intent)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("APP_SETTINGS_FAILED", e.message, null)
+                        }
+                    }
                     "getLatestNotification" -> result.success(HeyBroNotificationListenerService.latestText())
                     "getAutostartEnabled" -> result.success(bootPrefs.getBoolean(BootReceiver.KEY_AUTOSTART, false))
                     "setAutostartEnabled" -> {
@@ -224,6 +240,14 @@ class MainActivity : FlutterActivity() {
                         }
                         result.success(true)
                     }
+                    "deleteCustomAlias" -> {
+                        val phrase = call.argument<String>("phrase") ?: ""
+                        if (phrase.isNotBlank()) {
+                            VoiceLearningStore.initialize(applicationContext)
+                            VoiceLearningStore.remove(phrase)
+                        }
+                        result.success(true)
+                    }
                     "syncCustomAliases" -> {
                         val list = call.argument<List<Map<String, String>>>("aliases")
                         if (list != null) {
@@ -236,7 +260,7 @@ class MainActivity : FlutterActivity() {
                                     map[p] = a
                                 }
                             }
-                            VoiceLearningStore.learnBatch(map)
+                            VoiceLearningStore.replaceAll(map)
                         }
                         result.success(true)
                     }
@@ -287,6 +311,10 @@ class MainActivity : FlutterActivity() {
                 startAssistantService()
             }
         }
+        try {
+            val json = org.json.JSONObject(mapOf("type" to "permissions_updated")).toString()
+            CoreVoiceService.eventSink?.success(json)
+        } catch (_: Exception) {}
     }
 
     private fun startAssistantService() {

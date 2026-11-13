@@ -242,6 +242,11 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     try {
       final data = json.decode(raw as String) as Map<String, dynamic>;
+      if (data['type'] == 'permissions_updated') {
+        _checkPermissions();
+        return;
+      }
+
       final stateStr = data['state'] as String? ?? '';
       final transcript = data['transcript'] as String?;
       final response = data['response'] as String? ?? '';
@@ -597,6 +602,8 @@ class _DashboardScreenState extends State<DashboardScreen>
     final phraseCtrl = TextEditingController();
     final actionCtrl = TextEditingController();
     String? selectedAction;
+    bool filterOnlyCustom = false;
+    bool customInputMode = false;
 
     const commonPresets = [
       {'label': '🔦 Torch On', 'phrase': 'turn on torch', 'action': 'flashlightOn'},
@@ -608,6 +615,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       {'label': '🔉 Vol Down', 'phrase': 'volume down', 'action': 'volumeDown'},
       {'label': '💬 WhatsApp', 'phrase': 'open whatsapp', 'action': 'openApp:com.whatsapp'},
       {'label': '▶️ YouTube', 'phrase': 'open youtube', 'action': 'openApp:com.google.android.youtube'},
+      {'label': '🎵 Spotify', 'phrase': 'open spotify', 'action': 'openApp:com.spotify.music'},
       {'label': '📶 WiFi', 'phrase': 'turn on wifi', 'action': 'toggleWifi'},
       {'label': '📡 Bluetooth', 'phrase': 'turn on bluetooth', 'action': 'toggleBluetooth'},
       {'label': '🔒 Lock Screen', 'phrase': 'lock screen', 'action': 'lockScreen'},
@@ -646,6 +654,7 @@ class _DashboardScreenState extends State<DashboardScreen>
       'Open Spotify': 'openApp:com.spotify.music',
       'Open Google Maps': 'openMaps',
       'Open Settings': 'openSettings',
+      'Custom Action / App Package...': '__CUSTOM__',
     };
 
     await showModalBottomSheet(
@@ -654,176 +663,332 @@ class _DashboardScreenState extends State<DashboardScreen>
       backgroundColor: const Color(0xFF12131D),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(24))),
       builder: (ctx) {
-        debugPrint('BUILDING BOTTOM SHEET CONTENT');
         return StatefulBuilder(
-        builder: (ctx, setModalState) => Padding(
-          padding: EdgeInsets.only(
-            left: 20, right: 20, top: 20,
-            bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  const Text('Custom Shortcuts (SQLite)', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
-                  IconButton(icon: const Icon(Icons.close, color: Colors.white54), onPressed: () => Navigator.pop(ctx)),
-                ],
-              ),
-              const Text('Add local voice shortcuts executed in <50ms without network round-trip', style: TextStyle(color: Colors.white54, fontSize: 12)),
-              const SizedBox(height: 12),
+          builder: (ctx, setModalState) {
+            final customCount = aliases.where((a) => a['target_type'] == 'custom').length;
+            final displayedAliases = filterOnlyCustom
+                ? aliases.where((a) => a['target_type'] == 'custom').toList()
+                : aliases;
 
-              // Quick Preset Chips
-              SizedBox(
-                height: 36,
-                child: ListView.separated(
-                  scrollDirection: Axis.horizontal,
-                  itemCount: commonPresets.length,
-                  separatorBuilder: (_, i) => const SizedBox(width: 8),
-                  itemBuilder: (_, idx) {
-                    final p = commonPresets[idx];
-                    return ActionChip(
-                      label: Text(p['label']!, style: const TextStyle(fontSize: 11, color: Colors.white)),
-                      backgroundColor: Colors.white.withValues(alpha: 0.08),
-                      side: BorderSide.none,
-                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                      onPressed: () {
-                        setModalState(() {
-                          phraseCtrl.text = p['phrase']!;
-                          actionCtrl.text = p['action']!;
-                          selectedAction = p['action'];
-                        });
-                      },
-                    );
-                  },
-                ),
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 20, right: 20, top: 20,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
               ),
-              const SizedBox(height: 12),
-
-              Row(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: TextField(
-                      controller: phraseCtrl,
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      decoration: InputDecoration(
-                        hintText: "Phrase (e.g. 'torch')",
-                        hintStyle: const TextStyle(color: Colors.white30),
-                        filled: true,
-                        fillColor: Colors.white.withValues(alpha: 0.06),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
-                      ),
-                    ),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Text('Voice Shortcuts (SQLite)', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
+                      IconButton(icon: const Icon(Icons.close, color: Colors.white54), onPressed: () => Navigator.pop(ctx)),
+                    ],
                   ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: DropdownButtonFormField<String>(
-                      initialValue: selectedAction,
-                      dropdownColor: const Color(0xFF1B1C2A),
-                      isExpanded: true,
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      decoration: InputDecoration(
-                        hintText: 'Select action',
-                        hintStyle: const TextStyle(color: Colors.white30),
-                        filled: true,
-                        fillColor: Colors.white.withValues(alpha: 0.06),
-                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
-                      ),
-                      items: actionOptions.entries.map((e) => DropdownMenuItem(
-                        value: e.value,
-                        child: Text(e.key, style: const TextStyle(fontSize: 12), overflow: TextOverflow.ellipsis),
-                      )).toList(),
-                      onChanged: (val) {
-                        if (val != null) {
-                          setModalState(() {
-                            selectedAction = val;
-                            actionCtrl.text = val;
-                          });
-                        }
+                  const Text('Custom shortcuts execute locally in <50ms without network round-trip', style: TextStyle(color: Colors.white54, fontSize: 12)),
+                  const SizedBox(height: 12),
+
+                  // Quick Preset Chips
+                  SizedBox(
+                    height: 36,
+                    child: ListView.separated(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: commonPresets.length,
+                      separatorBuilder: (_, i) => const SizedBox(width: 8),
+                      itemBuilder: (_, idx) {
+                        final p = commonPresets[idx];
+                        return ActionChip(
+                          label: Text(p['label']!, style: const TextStyle(fontSize: 11, color: Colors.white)),
+                          backgroundColor: Colors.white.withValues(alpha: 0.08),
+                          side: BorderSide.none,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                          onPressed: () {
+                            setModalState(() {
+                              phraseCtrl.text = p['phrase']!;
+                              actionCtrl.text = p['action']!;
+                              selectedAction = p['action'];
+                              customInputMode = false;
+                            });
+                          },
+                        );
                       },
                     ),
                   ),
-                  const SizedBox(width: 8),
-                  IconButton.filled(
-                    icon: const Icon(Icons.add),
-                    onPressed: () async {
-                      final p = phraseCtrl.text.trim();
-                      final a = actionCtrl.text.trim().isNotEmpty ? actionCtrl.text.trim() : selectedAction;
-                      if (p.isNotEmpty && a != null && a.isNotEmpty) {
-                        await DatabaseHelper.instance.insertAlias(p, 'action', a);
-                        await _safeInvoke('addCustomAlias', {'phrase': p, 'action': a});
-                        phraseCtrl.clear();
-                        actionCtrl.clear();
-                        setModalState(() {
-                          selectedAction = null;
-                        });
-                        final updated = await DatabaseHelper.instance.getAliases();
-                        setModalState(() {
-                          aliases.clear();
-                          aliases.addAll(updated);
-                        });
-                      }
-                    },
-                  ),
-                ],
-              ),
-              const SizedBox(height: 16),
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text('Active Shortcuts (${aliases.length}):', style: const TextStyle(color: Colors.white70, fontSize: 13, fontWeight: FontWeight.w600)),
-                  TextButton.icon(
-                    icon: const Icon(Icons.sync_rounded, size: 14),
-                    label: const Text('Sync Native', style: TextStyle(fontSize: 11)),
-                    onPressed: () async {
-                      await _syncAliasesToNative();
-                      if (mounted) _showSnack('Synchronized ${aliases.length} shortcuts with native engine');
-                    },
-                  ),
-                ],
-              ),
-              const SizedBox(height: 4),
-              ConstrainedBox(
-                constraints: const BoxConstraints(maxHeight: 220),
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: aliases.length,
-                  itemBuilder: (ctx, i) {
-                    final item = aliases[i];
-                    return ListTile(
-                      dense: true,
-                      contentPadding: EdgeInsets.zero,
-                      leading: const Icon(Icons.bolt, color: Color(0xFF00E5CC), size: 18),
-                      title: Text(item['trigger_phrase'] as String, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-                      subtitle: Text("→ ${item['target_value']}", style: const TextStyle(color: Colors.white54, fontSize: 12)),
-                      trailing: IconButton(
-                        icon: const Icon(Icons.delete_outline, size: 18, color: Colors.white38),
+                  const SizedBox(height: 12),
+
+                  // Input fields
+                  Row(
+                    children: [
+                      Expanded(
+                        flex: 5,
+                        child: TextField(
+                          controller: phraseCtrl,
+                          style: const TextStyle(color: Colors.white, fontSize: 13),
+                          decoration: InputDecoration(
+                            hintText: "Phrase (e.g. 'my songs')",
+                            hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
+                            filled: true,
+                            fillColor: Colors.white.withValues(alpha: 0.06),
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        flex: 6,
+                        child: customInputMode
+                            ? TextField(
+                                controller: actionCtrl,
+                                style: const TextStyle(color: Colors.white, fontSize: 13),
+                                decoration: InputDecoration(
+                                  hintText: "openApp:pkg or action",
+                                  hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
+                                  filled: true,
+                                  fillColor: Colors.white.withValues(alpha: 0.06),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                                  suffixIcon: IconButton(
+                                    icon: const Icon(Icons.arrow_drop_down, color: Colors.white54),
+                                    onPressed: () => setModalState(() => customInputMode = false),
+                                  ),
+                                ),
+                              )
+                            : DropdownButtonFormField<String>(
+                                initialValue: actionOptions.containsValue(selectedAction) ? selectedAction : null,
+                                dropdownColor: const Color(0xFF1B1C2A),
+                                isExpanded: true,
+                                style: const TextStyle(color: Colors.white, fontSize: 13),
+                                decoration: InputDecoration(
+                                  hintText: 'Select action',
+                                  hintStyle: const TextStyle(color: Colors.white30, fontSize: 12),
+                                  filled: true,
+                                  fillColor: Colors.white.withValues(alpha: 0.06),
+                                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                                ),
+                                items: actionOptions.entries.map((e) => DropdownMenuItem(
+                                  value: e.value,
+                                  child: Text(e.key, style: const TextStyle(fontSize: 12), overflow: TextOverflow.ellipsis),
+                                )).toList(),
+                                onChanged: (val) {
+                                  if (val == '__CUSTOM__') {
+                                    setModalState(() {
+                                      customInputMode = true;
+                                      selectedAction = null;
+                                      actionCtrl.clear();
+                                    });
+                                  } else if (val != null) {
+                                    setModalState(() {
+                                      selectedAction = val;
+                                      actionCtrl.text = val;
+                                      customInputMode = false;
+                                    });
+                                  }
+                                },
+                              ),
+                      ),
+                      const SizedBox(width: 8),
+                      IconButton.filled(
+                        icon: const Icon(Icons.add),
+                        style: IconButton.styleFrom(
+                          backgroundColor: const Color(0xFF00E5CC),
+                          foregroundColor: Colors.black,
+                        ),
                         onPressed: () async {
-                          await DatabaseHelper.instance.deleteAlias(item['id'] as int);
+                          final p = phraseCtrl.text.trim();
+                          final a = actionCtrl.text.trim().isNotEmpty ? actionCtrl.text.trim() : selectedAction;
+                          if (p.isEmpty) {
+                            if (mounted) _showSnack('Please enter a spoken phrase');
+                            return;
+                          }
+                          if (a == null || a.isEmpty || a == '__CUSTOM__') {
+                            if (mounted) _showSnack('Please select or type an action');
+                            return;
+                          }
+
+                          await DatabaseHelper.instance.insertAlias(p, 'custom', a);
+                          await _safeInvoke('addCustomAlias', {'phrase': p, 'action': a});
+                          phraseCtrl.clear();
+                          actionCtrl.clear();
+                          setModalState(() {
+                            selectedAction = null;
+                            customInputMode = false;
+                          });
                           final updated = await DatabaseHelper.instance.getAliases();
                           setModalState(() {
                             aliases.clear();
                             aliases.addAll(updated);
                           });
+                          if (mounted) _showSnack('Added custom shortcut: "$p" → "$a"');
                         },
                       ),
-                    );
-                  },
-                ),
+                    ],
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Filter / Tabs
+                  Row(
+                    children: [
+                      FilterChip(
+                        label: Text('All (${aliases.length})', style: const TextStyle(fontSize: 11)),
+                        selected: !filterOnlyCustom,
+                        onSelected: (_) => setModalState(() => filterOnlyCustom = false),
+                        selectedColor: const Color(0xFF00E5CC).withValues(alpha: 0.2),
+                        checkmarkColor: const Color(0xFF00E5CC),
+                        side: BorderSide(color: !filterOnlyCustom ? const Color(0xFF00E5CC) : Colors.white24),
+                      ),
+                      const SizedBox(width: 8),
+                      FilterChip(
+                        label: Text('⭐ My Custom ($customCount)', style: TextStyle(fontSize: 11, color: customCount > 0 ? const Color(0xFF00E5CC) : Colors.white70)),
+                        selected: filterOnlyCustom,
+                        onSelected: (_) => setModalState(() => filterOnlyCustom = true),
+                        selectedColor: const Color(0xFF00E5CC).withValues(alpha: 0.2),
+                        checkmarkColor: const Color(0xFF00E5CC),
+                        side: BorderSide(color: filterOnlyCustom ? const Color(0xFF00E5CC) : Colors.white24),
+                      ),
+                      const Spacer(),
+                      TextButton.icon(
+                        icon: const Icon(Icons.sync_rounded, size: 14),
+                        label: const Text('Sync Native', style: TextStyle(fontSize: 11)),
+                        onPressed: () async {
+                          await _syncAliasesToNative();
+                          if (mounted) _showSnack('Synchronized ${aliases.length} shortcuts with native engine');
+                        },
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxHeight: (MediaQuery.of(ctx).size.height * 0.35).clamp(200.0, 360.0),
+                    ),
+                    child: displayedAliases.isEmpty
+                        ? Center(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 24),
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.flash_off_rounded, color: Colors.white24, size: 36),
+                                  const SizedBox(height: 8),
+                                  Text(
+                                    filterOnlyCustom
+                                        ? 'No custom shortcuts created yet.'
+                                        : 'No shortcuts available.',
+                                    style: const TextStyle(color: Colors.white60, fontSize: 13),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  const Text(
+                                    'Add one using the inputs above to run actions in <50ms!',
+                                    style: TextStyle(color: Colors.white30, fontSize: 11),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                        : ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: displayedAliases.length,
+                            itemBuilder: (ctx, i) {
+                              final item = displayedAliases[i];
+                              final isCustom = item['target_type'] == 'custom';
+                              final phrase = (item['trigger_phrase'] as String?) ?? '';
+                              final target = (item['target_value'] as String?) ?? '';
+
+                              return ListTile(
+                                dense: true,
+                                contentPadding: EdgeInsets.zero,
+                                leading: Icon(
+                                  isCustom ? Icons.stars_rounded : Icons.bolt,
+                                  color: isCustom ? const Color(0xFF00E5CC) : Colors.white38,
+                                  size: isCustom ? 20 : 18,
+                                ),
+                                title: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        phrase,
+                                        style: TextStyle(
+                                          color: isCustom ? Colors.white : Colors.white70,
+                                          fontWeight: isCustom ? FontWeight.bold : FontWeight.w500,
+                                        ),
+                                      ),
+                                    ),
+                                    if (isCustom)
+                                      Container(
+                                        margin: const EdgeInsets.only(right: 6),
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: const Color(0xFF00E5CC).withValues(alpha: 0.15),
+                                          borderRadius: BorderRadius.circular(4),
+                                          border: Border.all(color: const Color(0xFF00E5CC).withValues(alpha: 0.4)),
+                                        ),
+                                        child: const Text(
+                                          'CUSTOM',
+                                          style: TextStyle(color: Color(0xFF00E5CC), fontSize: 9, fontWeight: FontWeight.bold),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                                subtitle: Text(
+                                  "→ $target",
+                                  style: TextStyle(
+                                    color: isCustom ? const Color(0xFF00E5CC).withValues(alpha: 0.8) : Colors.white54,
+                                    fontSize: 12,
+                                  ),
+                                ),
+                                trailing: IconButton(
+                                  icon: Icon(
+                                    Icons.delete_outline,
+                                    size: 18,
+                                    color: isCustom ? Colors.redAccent.shade100 : Colors.white30,
+                                  ),
+                                  tooltip: isCustom ? 'Delete custom shortcut' : 'Remove shortcut',
+                                  onPressed: () async {
+                                    final id = item['id'] as int;
+                                    await DatabaseHelper.instance.deleteAlias(id);
+                                    await _safeInvoke('deleteCustomAlias', {'phrase': phrase});
+                                    final updated = await DatabaseHelper.instance.getAliases();
+                                    setModalState(() {
+                                      aliases.clear();
+                                      aliases.addAll(updated);
+                                    });
+                                    if (mounted) _showSnack('Removed shortcut "$phrase"');
+                                  },
+                                ),
+                              );
+                            },
+                          ),
+                  ),
+                ],
               ),
-            ],
-          ),
-        ),
-      );
-    },
-  );
-}
+            );
+          },
+        );
+      },
+    );
+  }
 
   void _showSnack(String msg) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg), duration: const Duration(seconds: 2)));
+  }
+
+  void _showMicSettingsSnack() {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: const Text('Microphone permission required. Open settings?'),
+        action: SnackBarAction(
+          label: 'Settings',
+          onPressed: () => _safeInvoke('openAppSettings'),
+        ),
+        duration: const Duration(seconds: 4),
+      ),
+    );
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -950,7 +1115,19 @@ class _DashboardScreenState extends State<DashboardScreen>
                   const _SectionHeader(title: 'Permissions', icon: Icons.security_rounded),
                   const SizedBox(height: 10),
 
-                  _PermTile(title: 'Microphone', icon: Icons.mic_rounded, granted: _hasMic, onFix: () => _safeInvoke('requestMicPermission')),
+                  _PermTile(
+                    title: 'Microphone',
+                    icon: Icons.mic_rounded,
+                    granted: _hasMic,
+                    onFix: () async {
+                      await _safeInvoke('requestMicPermission');
+                      await Future.delayed(const Duration(milliseconds: 600));
+                      await _checkPermissions();
+                      if (!_hasMic) {
+                        _showMicSettingsSnack();
+                      }
+                    },
+                  ),
                   _PermTile(title: 'Accessibility Service', icon: Icons.accessibility_new_rounded, granted: _hasA11y, onFix: () => _safeInvoke('openAccessibilitySettings')),
                   _PermTile(title: 'Draw Over Other Apps', icon: Icons.layers_rounded, granted: _hasOverlay, onFix: () => _safeInvoke('requestOverlayPermission')),
                   _PermTile(title: 'Notifications Access', icon: Icons.notifications_rounded, granted: _hasNotificationAccess, onFix: () => _safeInvoke('openNotificationListenerSettings')),
