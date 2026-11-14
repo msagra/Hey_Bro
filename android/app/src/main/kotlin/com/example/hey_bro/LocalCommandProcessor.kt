@@ -18,27 +18,16 @@ object LocalCommandProcessor {
 
     private const val TAG = "LocalCommandProcessor"
     private var geminiBridge: GeminiIntentBridge? = null
-    private var groqBridge: GroqIntentBridge? = null
     private var appContext: Context? = null
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
         VoiceLearningStore.initialize(context)
         geminiBridge = GeminiIntentBridge(context)
-        groqBridge = GroqIntentBridge(context)
     }
 
     fun interpretWithGemini(transcript: String): Result? {
-        val geminiResult = geminiBridge?.interpret(transcript)
-        if (geminiResult != null) return geminiResult
-
-        // Seamless zero-latency fallback to Groq (Llama 3.3 70B / Llama 3.1 8B)
-        Log.i(TAG, "Gemini REST unavailable or failed; executing Groq edge fallback...")
-        return groqBridge?.interpret(transcript)
-    }
-
-    fun interpretWithGroq(transcript: String): Result? {
-        return groqBridge?.interpret(transcript)
+        return geminiBridge?.interpret(transcript)
     }
 
     data class Result(
@@ -457,13 +446,8 @@ object LocalCommandProcessor {
                 Result(action("sleep"), "Going to sleep. Say Hey Bro to wake me up.")
 
             else -> {
-                Log.d(TAG, "No local rule matched for: \"$t\", querying Gemini Alexa/Echo bridge")
-                val geminiResult = interpretWithGemini(rawTranscript)
-                if (geminiResult != null && geminiResult.reply.isNotBlank()) {
-                    geminiResult
-                } else {
-                    Result(null, "Sorry, I didn't understand \"$rawTranscript\". Try asking for flashlight, alarms, calls, notifications, or general questions.")
-                }
+                Log.d(TAG, "No local rule matched for: \"$t\"")
+                Result(null, "Sorry, I didn't understand \"$rawTranscript\". Try asking for flashlight, alarms, calls, notifications, or general questions.")
             }
         }
     }

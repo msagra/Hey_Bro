@@ -94,7 +94,7 @@ class CoreVoiceService : Service(),
                 audioFocusRequested = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             } else {
                 @Suppress("DEPRECATION")
-                val res = am.requestAudioFocus(null, AudioManager.STREAM_VOICE_CALL, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                val res = am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
                 audioFocusRequested = res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
             }
             Log.d(TAG, "Audio focus requested: $audioFocusRequested")
@@ -565,6 +565,11 @@ class CoreVoiceService : Service(),
     }
 
     override fun onError(errorCode: Int) {
+        if (serviceState != ServiceState.LISTENING) {
+            Log.d(TAG, "Ignoring stale STT error $errorCode while service is $serviceState")
+            return
+        }
+
         lastFailedListenAtMs = SystemClock.elapsedRealtime()
         sttFailureCount++
 
@@ -906,10 +911,9 @@ class CoreVoiceService : Service(),
                 applicationContext,
                 0,
                 launchIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-                options.toBundle()
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
-            pi.send()
+            pi.send(applicationContext, 0, null, null, null, null, options.toBundle())
         } catch (e: Exception) {
             Log.w(TAG, "Failed to launch lockscreen overlay via PendingIntent: ${e.message}")
         }

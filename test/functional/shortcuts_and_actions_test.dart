@@ -35,7 +35,9 @@ void main() {
         'toggleWifi',
         'toggleBluetooth',
         'toggleHotspot',
+        'toggleAirplaneMode',
         'openMaps',
+        'openSettings',
         'openApp:'
       ];
 

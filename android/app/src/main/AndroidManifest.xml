@@ -17,7 +17,6 @@
     <!-- ── Foreground Service ────────────────────────────────────────────── -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_PHONE_CALL" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!-- ── Overlay / System UI ───────────────────────────────────────────── -->
@@ -76,10 +75,10 @@
         <!-- Flutter metadata -->
         <meta-data android:name="flutterEmbedding" android:value="2" />
 
-        <!-- ── Core Voice Service (foreground, mic + phoneCall) ────────────── -->
+        <!-- ── Core Voice Service (foreground microphone) ─────────────────── -->
         <service
             android:name=".CoreVoiceService"
-            android:foregroundServiceType="microphone|phoneCall"
+            android:foregroundServiceType="microphone"
             android:exported="false" />
 
         <!-- ── Voice Interaction (system assistant) ───────────────────────── -->

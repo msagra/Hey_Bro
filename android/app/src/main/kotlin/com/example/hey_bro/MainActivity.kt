@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
 
     private lateinit var bootPrefs: SharedPreferences
     private lateinit var settingsPrefs: SharedPreferences
+    private var pendingMicResult: io.flutter.plugin.common.MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -76,8 +77,12 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         if (activeActivity === this) activeActivity = null
+        try {
+            pendingMicResult?.error("ACTIVITY_DESTROYED", "Activity destroyed before permission response", null)
+        } catch (_: Exception) {}
+        pendingMicResult = null
+        super.onDestroy()
     }
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
@@ -148,10 +153,15 @@ class MainActivity : FlutterActivity() {
                         }
                     }
                     "requestMicPermission"    -> {
-                        ActivityCompat.requestPermissions(
-                            this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERMISSION_CODE
-                        )
-                        result.success(true)
+                        val alreadyGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                        if (alreadyGranted) {
+                            result.success(true)
+                        } else {
+                            pendingMicResult = result
+                            ActivityCompat.requestPermissions(
+                                this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERMISSION_CODE
+                            )
+                        }
                     }
                     "requestCameraPermission" -> {
                         ActivityCompat.requestPermissions(
@@ -305,6 +315,21 @@ class MainActivity : FlutterActivity() {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_PERMISSION_CODE) {
+            val granted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                val notifGranted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                } else true
+                if (notifGranted) {
+                    startAssistantService()
+                }
+            }
+            try {
+                pendingMicResult?.success(granted)
+            } catch (_: Exception) {}
+            pendingMicResult = null
+        }
         if (requestCode == NOTIFICATION_PERMISSION_CODE && grantResults.isNotEmpty()) {
             val allGranted = grantResults.all { it == PackageManager.PERMISSION_GRANTED }
             if (allGranted) {

@@ -18,8 +18,9 @@ class GroqIntentBridge(private val context: Context) {
     companion object {
         private const val TAG = "GroqIntentBridge"
         private const val GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
-        private const val PRIMARY_MODEL = "llama-3.3-70b-versatile"
-        private const val FAST_MODEL = "llama-3.1-8b-instant"
+        private const val PRIMARY_MODEL = "qwen/qwen3.8-27b"
+        private const val FAST_MODEL = "openai/gpt-oss-120b"
+        private const val FALLBACK_MODEL = "openai/gpt-oss-20b"
     }
 
     private val supportedActions = setOf(
@@ -60,7 +61,7 @@ class GroqIntentBridge(private val context: Context) {
             "For general Q&A, chit-chat, or knowledge, set action to \"none\", params to {}, and provide a concise, friendly spoken answer under 25 words in \"reply\". " +
             "Do NOT include markdown syntax (no asterisks, hash marks, or backticks)."
 
-        val modelsToTry = listOf(PRIMARY_MODEL, FAST_MODEL)
+        val modelsToTry = listOf(PRIMARY_MODEL, FAST_MODEL, FALLBACK_MODEL, "llama-3.3-70b-versatile")
 
         for (model in modelsToTry) {
             try {

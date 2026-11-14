@@ -49,7 +49,7 @@ android {
         applicationId = "com.example.hey_bro"
         // Minimum Android 8 (Oreo) – required for TYPE_APPLICATION_OVERLAY, VibrationEffect, startForegroundService
         minSdk        = 26
-        targetSdk     = flutter.targetSdkVersion
+        targetSdk     = 35
         versionCode   = flutter.versionCode
         versionName   = flutter.versionName
 

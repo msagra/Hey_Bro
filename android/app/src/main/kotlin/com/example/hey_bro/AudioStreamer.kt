@@ -48,15 +48,15 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         private val RETRY_DELAYS_MS = longArrayOf(500, 1_000, 2_000, 4_000, 6_000, 10_000)
         private const val GEMINI_LIVE_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
-        const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
+        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-2.5-flash" }
+        const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash"
     }
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
     private var webSocket: WebSocket? = null
     private var wsUrl: String = ""
     private var apiKey: String = ""
-    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
+    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-2.5-flash" }
     private val isConnected = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
     private val setupComplete = AtomicBoolean(false)
@@ -87,15 +87,16 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         }
     }
 
-    fun isConnected(): Boolean = isConnected.get()
+    fun isConnected(): Boolean =
+        isConnected.get() && (!isGeminiLive || setupComplete.get())
     private var retryCount = 0
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val httpClient = OkHttpClient.Builder()
-        .connectTimeout(3, TimeUnit.SECONDS)
-        .writeTimeout(3, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .writeTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(20, TimeUnit.SECONDS) // 20-second keep-alive ping while warm
+        .pingInterval(0, TimeUnit.SECONDS) // Disable automatic OkHttp ping to prevent 20s pong timeout drops on Gemini Live
         .build()
 
     // ── AudioTrack (Live 24kHz playback) ──────────────────────────────────────
@@ -182,7 +183,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     fun sendAudioChunk(chunk: ByteArray) {
-        if (!isConnected.get()) return
+        if (!isConnected()) return
         lastAudioActivityMs = System.currentTimeMillis()
 
         if (isGeminiLive) {
@@ -646,8 +647,11 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
             isConnected.set(true)
             isConnecting.set(false)
             retryCount = 0
-            listener.onConnectionStateChanged(true)
-            sendSetupHandshake()
+            if (isGeminiLive) {
+                sendSetupHandshake()
+            } else {
+                listener.onConnectionStateChanged(true)
+            }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
@@ -664,6 +668,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                 if (root.has("setupComplete") || root.has("serverContent") || root.has("toolCall")) {
                     if (!setupComplete.getAndSet(true)) {
                         Log.i(TAG, "Gemini Live setup handshake confirmed ✓")
+                        listener.onConnectionStateChanged(true)
                     }
                 }
 
@@ -756,12 +761,13 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.e(TAG, "Gemini Live WebSocket failure: ${t.message}")
-            if (activeLiveModel != FALLBACK_LIVE_MODEL) {
+            if (response?.code == 404 && activeLiveModel != FALLBACK_LIVE_MODEL) {
                 Log.w(TAG, "Attempting connection fallback from $activeLiveModel to $FALLBACK_LIVE_MODEL")
                 activeLiveModel = FALLBACK_LIVE_MODEL
             }
             isConnected.set(false)
             isConnecting.set(false)
+            setupComplete.set(false)
             listener.onConnectionStateChanged(false)
             scheduleReconnect()
         }

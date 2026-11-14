@@ -23,6 +23,13 @@ void main() {
       expect(triggerPhrases, contains('take a selfie'));
       expect(triggerPhrases, contains('open whatsapp'));
       expect(triggerPhrases, contains('open youtube'));
+      expect(triggerPhrases, contains('open chrome'));
+      expect(triggerPhrases, contains('open instagram'));
+      expect(triggerPhrases, contains('open telegram'));
+      expect(triggerPhrases, contains('open settings'));
+      expect(triggerPhrases, contains('open calculator'));
+      expect(triggerPhrases, contains('airplane mode'));
+      expect(triggerPhrases, contains('play music'));
     });
 
     test('Exact and fuzzy alias search works as expected', () async {

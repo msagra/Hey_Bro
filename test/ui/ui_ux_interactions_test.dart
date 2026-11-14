@@ -259,5 +259,71 @@ WAKE_PHRASE=hey bro
       expect(invokedMethods, contains('openAccessibilitySettings'));
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('Voice shortcuts dashboard renders and microphone grant invokes requestMicPermission', (WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1260, 2800);
+      tester.view.devicePixelRatio = 2.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      const channel = MethodChannel('com.example.hey_bro/assistant');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall methodCall) async {
+        invokedMethods.add(methodCall.method);
+        switch (methodCall.method) {
+          case 'checkPermissions':
+            return {
+              'mic': false,
+              'camera': true,
+              'accessibility': true,
+              'overlay': true,
+              'notification': true,
+              'battery': true,
+            };
+          case 'getActiveWakeEngine':
+            return 'SileroVad+HeyBroEngine';
+          case 'getAutostartEnabled':
+            return true;
+          case 'getLaunchIntentType':
+            return 'normal';
+          case 'getBackendWs':
+            return 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+          case 'requestMicPermission':
+            return true;
+          default:
+            return true;
+        }
+      });
+
+      await tester.pumpWidget(const HeyBroApp());
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+
+      // Verify Voice Shortcuts section exists on dashboard
+      final shortcutsHeader = find.text('Voice Shortcuts');
+      expect(shortcutsHeader, findsOneWidget);
+
+      // Verify Fast-Path badge exists when no custom shortcuts yet
+      expect(find.textContaining('Fast-Path Active'), findsOneWidget);
+
+      // Scroll to Microphone permission tile
+      final micFinder = find.text('Microphone');
+      await tester.scrollUntilVisible(
+        micFinder,
+        200,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(micFinder, findsOneWidget);
+
+      // Find Microphone Grant button
+      final micGrant = find.widgetWithText(FilledButton, 'Grant').first;
+      expect(micGrant, findsOneWidget);
+      await tester.tap(micGrant);
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
+
+      expect(invokedMethods, contains('requestMicPermission'));
+      expect(tester.takeException(), isNull);
+    });
   });
 }

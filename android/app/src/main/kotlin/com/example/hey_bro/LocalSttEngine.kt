@@ -251,9 +251,10 @@ class LocalSttEngine(private val context: Context) {
                 if (internalRetryCount < 2) {
                     internalRetryCount++
                     val delayMs = 400L * internalRetryCount
+                    val retryGeneration = startGeneration
                     Log.w(TAG, "Recoverable STT error ($error); rebuilding recognizer (retry $internalRetryCount/2 in ${delayMs}ms)")
                     mainHandler.postDelayed({
-                        if (!isInitialized || destroyed) return@postDelayed
+                        if (!isInitialized || destroyed || startGeneration != retryGeneration) return@postDelayed
                         try {
                             recreateRecognizerLocked()
                             startListeningOnMain()
@@ -272,10 +273,11 @@ class LocalSttEngine(private val context: Context) {
                 if (startedAgo < SHORT_START_THRESHOLD_MS && internalRetryCount < 2) {
                     internalRetryCount++
                     val retryDelay = if (postTtsStart) 400L else 600L
+                    val retryGeneration = startGeneration
                     Log.d(TAG, "Quick NO_MATCH after $startedAgo ms — measured retry #$internalRetryCount (delay=${retryDelay}ms)")
                     mainHandler.postDelayed({
                         try {
-                            if (!isInitialized || destroyed) return@postDelayed
+                            if (!isInitialized || destroyed || startGeneration != retryGeneration) return@postDelayed
                             if (recognizer == null) recreateRecognizerLocked()
                             startListeningOnMain()
                         } catch (retryError: Exception) {

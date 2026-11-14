@@ -126,8 +126,9 @@ class _DashboardScreenState extends State<DashboardScreen>
   bool _hasSendSms    = false;
   bool _hasNotificationAccess = false;
 
-  // ── Conversation ───────────────────────────────────────────────────────────
+  // ── Conversation & Shortcuts ───────────────────────────────────────────────
   final List<_Exchange> _history = [];
+  List<Map<String, dynamic>> _customShortcuts = [];
   String? _pendingTranscript;
 
   // ── Animations ────────────────────────────────────────────────────────────
@@ -475,6 +476,11 @@ class _DashboardScreenState extends State<DashboardScreen>
   Future<void> _syncAliasesToNative() async {
     try {
       final list = await DatabaseHelper.instance.getAliases();
+      if (mounted) {
+        setState(() {
+          _customShortcuts = list;
+        });
+      }
       final mapped = list.map((item) => {
         'phrase': (item['trigger_phrase'] as String?) ?? '',
         'action': (item['target_value'] as String?) ?? '',
@@ -610,18 +616,32 @@ class _DashboardScreenState extends State<DashboardScreen>
       {'label': '🔦 Torch Off', 'phrase': 'turn off torch', 'action': 'flashlightOff'},
       {'label': '🤳 Selfie', 'phrase': 'take a selfie', 'action': 'takeSelfie'},
       {'label': '📸 Screenshot', 'phrase': 'take screenshot', 'action': 'screenshot'},
+      {'label': '📷 Open Camera', 'phrase': 'open camera', 'action': 'openCamera'},
       {'label': '🔇 Mute', 'phrase': 'silence phone', 'action': 'mute'},
       {'label': '🔊 Vol Up', 'phrase': 'volume up', 'action': 'volumeUp'},
       {'label': '🔉 Vol Down', 'phrase': 'volume down', 'action': 'volumeDown'},
+      {'label': '🎵 Play Music', 'phrase': 'play music', 'action': 'mediaPlayPause'},
+      {'label': '⏭️ Next Song', 'phrase': 'next song', 'action': 'mediaNext'},
       {'label': '💬 WhatsApp', 'phrase': 'open whatsapp', 'action': 'openApp:com.whatsapp'},
       {'label': '▶️ YouTube', 'phrase': 'open youtube', 'action': 'openApp:com.google.android.youtube'},
       {'label': '🎵 Spotify', 'phrase': 'open spotify', 'action': 'openApp:com.spotify.music'},
+      {'label': '🌐 Chrome', 'phrase': 'open chrome', 'action': 'openApp:com.android.chrome'},
+      {'label': '📸 Instagram', 'phrase': 'open instagram', 'action': 'openApp:com.instagram.android'},
+      {'label': '✈️ Telegram', 'phrase': 'open telegram', 'action': 'openApp:org.telegram.messenger'},
+      {'label': '🔢 Calculator', 'phrase': 'open calculator', 'action': 'openApp:com.google.android.calculator'},
+      {'label': '📅 Calendar', 'phrase': 'open calendar', 'action': 'openApp:com.google.android.calendar'},
+      {'label': '⏰ Clock', 'phrase': 'open clock', 'action': 'openApp:com.google.android.deskclock'},
+      {'label': '📧 Gmail', 'phrase': 'open gmail', 'action': 'openApp:com.google.android.gm'},
+      {'label': '🖼️ Photos', 'phrase': 'open gallery', 'action': 'openApp:com.google.android.apps.photos'},
       {'label': '📶 WiFi', 'phrase': 'turn on wifi', 'action': 'toggleWifi'},
       {'label': '📡 Bluetooth', 'phrase': 'turn on bluetooth', 'action': 'toggleBluetooth'},
+      {'label': '📶 Hotspot', 'phrase': 'turn on hotspot', 'action': 'toggleHotspot'},
+      {'label': '✈️ Airplane', 'phrase': 'airplane mode', 'action': 'toggleAirplaneMode'},
       {'label': '🔒 Lock Screen', 'phrase': 'lock screen', 'action': 'lockScreen'},
       {'label': '🌙 DND', 'phrase': 'do not disturb', 'action': 'doNotDisturb'},
       {'label': '🔋 Battery Saver', 'phrase': 'battery saver', 'action': 'batterySaver'},
       {'label': '🗺️ Maps', 'phrase': 'open maps', 'action': 'openMaps'},
+      {'label': '⚙️ Settings', 'phrase': 'open settings', 'action': 'openSettings'},
     ];
 
     const actionOptions = {
@@ -654,6 +674,14 @@ class _DashboardScreenState extends State<DashboardScreen>
       'Open Spotify': 'openApp:com.spotify.music',
       'Open Google Maps': 'openMaps',
       'Open Settings': 'openSettings',
+      'Open Chrome': 'openApp:com.android.chrome',
+      'Open Instagram': 'openApp:com.instagram.android',
+      'Open Telegram': 'openApp:org.telegram.messenger',
+      'Open Calculator': 'openApp:com.google.android.calculator',
+      'Open Calendar': 'openApp:com.google.android.calendar',
+      'Open Clock': 'openApp:com.google.android.deskclock',
+      'Open Gmail': 'openApp:com.google.android.gm',
+      'Open Photos': 'openApp:com.google.android.apps.photos',
       'Custom Action / App Package...': '__CUSTOM__',
     };
 
@@ -821,6 +849,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                             aliases.clear();
                             aliases.addAll(updated);
                           });
+                          await _syncAliasesToNative();
                           if (mounted) _showSnack('Added custom shortcut: "$p" → "$a"');
                         },
                       ),
@@ -956,6 +985,7 @@ class _DashboardScreenState extends State<DashboardScreen>
                                       aliases.clear();
                                       aliases.addAll(updated);
                                     });
+                                    await _syncAliasesToNative();
                                     if (mounted) _showSnack('Removed shortcut "$phrase"');
                                   },
                                 ),
@@ -1112,6 +1142,23 @@ class _DashboardScreenState extends State<DashboardScreen>
                     const SizedBox(height: 28),
                   ],
 
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      const Expanded(
+                        child: _SectionHeader(title: 'Voice Shortcuts', icon: Icons.flash_on_rounded),
+                      ),
+                      TextButton.icon(
+                        icon: const Icon(Icons.tune_rounded, size: 14, color: Color(0xFF00E5CC)),
+                        label: const Text('Manage', style: TextStyle(fontSize: 12, color: Color(0xFF00E5CC))),
+                        onPressed: _openAliasesDialog,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 10),
+                  _buildShortcutsDashboard(),
+                  const SizedBox(height: 28),
+
                   const _SectionHeader(title: 'Permissions', icon: Icons.security_rounded),
                   const SizedBox(height: 10),
 
@@ -1120,10 +1167,9 @@ class _DashboardScreenState extends State<DashboardScreen>
                     icon: Icons.mic_rounded,
                     granted: _hasMic,
                     onFix: () async {
-                      await _safeInvoke('requestMicPermission');
-                      await Future.delayed(const Duration(milliseconds: 600));
+                      final granted = await _safeInvoke<bool>('requestMicPermission') ?? false;
                       await _checkPermissions();
-                      if (!_hasMic) {
+                      if (!granted && !_hasMic) {
                         _showMicSettingsSnack();
                       }
                     },
@@ -1139,6 +1185,81 @@ class _DashboardScreenState extends State<DashboardScreen>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildShortcutsDashboard() {
+    final customList = _customShortcuts.where((a) => a['target_type'] == 'custom').toList();
+    if (customList.isNotEmpty) {
+      return Column(
+        children: customList.map((item) {
+          final phrase = (item['trigger_phrase'] as String?) ?? '';
+          final action = (item['target_value'] as String?) ?? '';
+          final id = item['id'] as int;
+          return Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFF111118),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(color: const Color(0xFF00E5CC).withValues(alpha: 0.2)),
+            ),
+            child: ListTile(
+              dense: true,
+              leading: const Icon(Icons.stars_rounded, color: Color(0xFF00E5CC), size: 20),
+              title: Text(
+                phrase,
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5, color: Colors.white),
+              ),
+              subtitle: Text(
+                '→ $action (<50ms)',
+                style: TextStyle(color: const Color(0xFF00E5CC).withValues(alpha: 0.8), fontSize: 11.5),
+              ),
+              trailing: IconButton(
+                icon: Icon(Icons.delete_outline_rounded, size: 18, color: Colors.redAccent.shade100),
+                tooltip: 'Delete shortcut',
+                onPressed: () async {
+                  await DatabaseHelper.instance.deleteAlias(id);
+                  await _safeInvoke('deleteCustomAlias', {'phrase': phrase});
+                  await _syncAliasesToNative();
+                  if (mounted) _showSnack('Removed shortcut "$phrase"');
+                },
+              ),
+            ),
+          );
+        }).toList(),
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF111118),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: const [
+          Row(
+            children: [
+              Icon(Icons.flash_on_rounded, size: 16, color: Color(0xFF00E5CC)),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Deterministic Sub-50ms Fast-Path Active',
+                  style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12.5, color: Colors.white70),
+                ),
+              ),
+            ],
+          ),
+          SizedBox(height: 6),
+          Text(
+            'Say "torch", "take screenshot", "selfie", or tap Manage to add your own custom phrases.',
+            style: TextStyle(fontSize: 11.5, color: Colors.white38),
+          ),
+        ],
       ),
     );
   }
@@ -1338,7 +1459,20 @@ class _SectionHeader extends StatelessWidget {
   const _SectionHeader({required this.title, required this.icon});
   @override
   Widget build(BuildContext context) {
-    return Row(children: [Icon(icon, size: 17, color: Colors.white38), const SizedBox(width: 8), Text(title, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white54))]);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, size: 17, color: Colors.white38),
+        const SizedBox(width: 8),
+        Flexible(
+          child: Text(
+            title,
+            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w700, color: Colors.white54),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
+    );
   }
 }
 
