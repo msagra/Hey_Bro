@@ -140,6 +140,9 @@ class _DashboardScreenState extends State<DashboardScreen>
   Timer?              _permissionTimer;
   StreamSubscription? _eventSub;
   String?             _lastRawEvent;
+  bool                _showSiriOverlay = false;
+  String              _screenContext   = '';
+  Timer?              _siriDismissTimer;
 
   @override
   void initState() {
@@ -184,6 +187,7 @@ class _DashboardScreenState extends State<DashboardScreen>
     _pulseCtrl.dispose();
     _waveCtrl.dispose();
     _permissionTimer?.cancel();
+    _siriDismissTimer?.cancel();
     _eventSub?.cancel();
     super.dispose();
   }
@@ -277,6 +281,22 @@ class _DashboardScreenState extends State<DashboardScreen>
       }
 
       if (hasStateChanged || hasWsChanged || hasEngineChanged || hasTranscriptChanged) {
+        if (newState == AssistantState.listening) {
+          _siriDismissTimer?.cancel();
+          _siriDismissTimer = null;
+          _showSiriOverlay = true;
+        } else if (newState == AssistantState.idle) {
+          if (_showSiriOverlay && _siriDismissTimer == null) {
+            _siriDismissTimer = Timer(const Duration(milliseconds: 1400), () {
+              if (mounted && _assistantState == AssistantState.idle) {
+                setState(() {
+                  _showSiriOverlay = false;
+                });
+              }
+            });
+          }
+        }
+
         setState(() {
           _assistantState = newState;
           _wsConnected = newWsConnected;
@@ -425,33 +445,21 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     if (!mounted) return;
 
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: Colors.transparent,
-      barrierColor: Colors.transparent,
-      builder: (ctx) {
-        return SiriOrbOverlay(
-          state: _mapSiriState(_assistantState),
-          transcript: _pendingTranscript ?? '',
-          responseText: _history.isNotEmpty ? _history.first.assistant : '',
-          screenContext: screenCtx,
-          onMicTap: () async {
-            try {
-              await _platform.invokeMethod('triggerAssistant');
-            } catch (e) {
-              debugPrint('Trigger error: $e');
-            }
-          },
-          onDismiss: () => Navigator.of(ctx).pop(),
-          onInterrupt: () async {
-            try {
-              await _platform.invokeMethod('triggerAssistant');
-            } catch (_) {}
-          },
-        );
-      },
-    );
+    _siriDismissTimer?.cancel();
+    _siriDismissTimer = null;
+
+    setState(() {
+      _screenContext = screenCtx;
+      _showSiriOverlay = true;
+    });
+
+    if (_assistantState == AssistantState.idle) {
+      try {
+        await _platform.invokeMethod('triggerAssistant');
+      } catch (e) {
+        debugPrint('Trigger error: $e');
+      }
+    }
   }
 
   SiriState _mapSiriState(AssistantState state) {
@@ -1029,8 +1037,10 @@ class _DashboardScreenState extends State<DashboardScreen>
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF07070E),
-      body: SafeArea(
-        child: CustomScrollView(
+      body: Stack(
+        children: [
+          SafeArea(
+            child: CustomScrollView(
           physics: const BouncingScrollPhysics(),
           slivers: [
             SliverAppBar(
@@ -1186,7 +1196,37 @@ class _DashboardScreenState extends State<DashboardScreen>
           ],
         ),
       ),
-    );
+      if (_showSiriOverlay)
+        Positioned.fill(
+          child: SiriOrbOverlay(
+            state: _mapSiriState(_assistantState),
+            transcript: _pendingTranscript ?? '',
+            responseText: _history.isNotEmpty ? _history.first.assistant : '',
+            screenContext: _screenContext,
+            onMicTap: () async {
+              try {
+                await _platform.invokeMethod('triggerAssistant');
+              } catch (e) {
+                debugPrint('Trigger error: $e');
+              }
+            },
+            onDismiss: () {
+              _siriDismissTimer?.cancel();
+              _siriDismissTimer = null;
+              setState(() {
+                _showSiriOverlay = false;
+              });
+            },
+            onInterrupt: () async {
+              try {
+                await _platform.invokeMethod('triggerAssistant');
+              } catch (_) {}
+            },
+          ),
+        ),
+    ],
+  ),
+);
   }
 
   Widget _buildShortcutsDashboard() {

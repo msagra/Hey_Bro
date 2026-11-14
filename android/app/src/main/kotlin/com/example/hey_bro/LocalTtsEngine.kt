@@ -111,13 +111,18 @@ class LocalTtsEngine(private val context: Context) {
     }
 
     fun speak(text: String) {
-        if (!isReady || tts == null) {
-            Log.w(TAG, "TTS not ready, dropping: \"$text\"")
+        if (!isReady || tts == null || text.isBlank()) {
+            Log.w(TAG, "TTS not ready or text blank, dropping: \"$text\"")
+            listener?.onSpeechDone()
             return
         }
         val utteranceId = UUID.randomUUID().toString()
         val params = Bundle()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        val res = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+        if (res != TextToSpeech.SUCCESS) {
+            Log.w(TAG, "TTS speak failed with code $res, notifying completion")
+            listener?.onSpeechDone()
+        }
         Log.d(TAG, "TTS speak: \"$text\"")
     }
 

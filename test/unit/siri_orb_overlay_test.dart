@@ -115,5 +115,24 @@ void main() {
       await tester.tap(closeButton);
       expect(dismissed, isTrue);
     });
+
+    testWidgets('Second invocation seamless transition without widget leak', (WidgetTester tester) async {
+      // First invocation: listening -> processing -> speaking -> idle
+      await tester.pumpWidget(buildTestOrb(state: SiriState.listening, transcript: 'First command'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('First command'), findsOneWidget);
+
+      await tester.pumpWidget(buildTestOrb(state: SiriState.speaking, responseText: 'First reply'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.text('First reply'), findsOneWidget);
+
+      await tester.pumpWidget(buildTestOrb(state: SiriState.idle));
+      await tester.pump(const Duration(milliseconds: 100));
+
+      // Second invocation immediately following:
+      await tester.pumpWidget(buildTestOrb(state: SiriState.listening, transcript: 'Second command'));
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(find.textContaining('Second command'), findsOneWidget);
+    });
   });
 }

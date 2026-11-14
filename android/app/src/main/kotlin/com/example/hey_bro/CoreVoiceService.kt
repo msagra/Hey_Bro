@@ -31,6 +31,7 @@ import io.flutter.plugin.common.EventChannel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -158,6 +159,50 @@ class CoreVoiceService : Service(),
     private val audioRecordLock = Any()
     private var audioJob:    Job?         = null
     private var captureJob: Job? = null
+    @Volatile private var captureAudioRecord: AudioRecord? = null
+
+    private val startWakeWordRunnable = Runnable {
+        if (!serviceDestroyed && serviceState == ServiceState.IDLE) {
+            startWakeWordLoop()
+        }
+    }
+
+    private var stateWatchdogJob: Job? = null
+
+    private fun scheduleStateWatchdog(timeoutMs: Long, expectedState: ServiceState) {
+        stateWatchdogJob?.cancel()
+        stateWatchdogJob = scope.launch {
+            delay(timeoutMs)
+            if (isActive && serviceState == expectedState) {
+                Log.w(TAG, "Watchdog timeout after ${timeoutMs}ms in state $expectedState; recovering to IDLE")
+                resetToIdle()
+                pushEvent(mapOf("state" to "IDLE", "watchdogRecovered" to "true"))
+                overlayManager.hideDelayed(300)
+            }
+        }
+    }
+
+    private fun cancelStateWatchdog() {
+        stateWatchdogJob?.cancel()
+        stateWatchdogJob = null
+    }
+
+    private fun stopCaptureAudio() {
+        captureJob?.cancel()
+        captureJob = null
+        val rec = captureAudioRecord
+        captureAudioRecord = null
+        if (rec != null) {
+            try {
+                if (rec.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                    rec.stop()
+                }
+            } catch (_: Throwable) {}
+            try {
+                rec.release()
+            } catch (_: Throwable) {}
+        }
+    }
     private val serviceJob = Job()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
@@ -429,6 +474,9 @@ class CoreVoiceService : Service(),
 
     override fun onDestroy() {
         serviceDestroyed = true
+        mainHandler.removeCallbacks(startWakeWordRunnable)
+        cancelStateWatchdog()
+        stopCaptureAudio()
         cancelBackendFallback()
         backendResponseHandler.removeCallbacksAndMessages(null)
         try { audioStreamer?.stopAll() } catch (_: Exception) {}
@@ -785,6 +833,11 @@ class CoreVoiceService : Service(),
     @SuppressLint("MissingPermission")
     private fun startWakeWordLoop() {
         if (audioJob?.isActive == true) return
+        if (serviceDestroyed || serviceState != ServiceState.IDLE) return
+
+        if (wakeWordManager?.activeEngine == null) {
+            initWakeWordEngine()
+        }
 
         audioJob = scope.launch {
             var recorder: AudioRecord? = null
@@ -795,7 +848,14 @@ class CoreVoiceService : Service(),
                 )
                 val bufSize = maxOf(minBuf, frameLength * 2)
 
-                val createdRecorder = createAudioRecord(SAMPLE_RATE, bufSize)
+                var createdRecorder: AudioRecord? = null
+                for (attempt in 1..4) {
+                    if (!isActive || serviceState != ServiceState.IDLE) return@launch
+                    createdRecorder = createAudioRecord(SAMPLE_RATE, bufSize)
+                    if (createdRecorder != null) break
+                    delay(120L * attempt)
+                }
+
                 if (createdRecorder == null) {
                     Log.e(TAG, "Wake word loop: failed to initialize AudioRecord across audio sources")
                     return@launch
@@ -815,7 +875,7 @@ class CoreVoiceService : Service(),
 
                 Log.i(TAG, "Continuous 16kHz AudioRecord wake loop active (OriginOS 6 / Dimensity 9400+ background mic)")
 
-                while (isActive) {
+                while (isActive && serviceState == ServiceState.IDLE) {
                     val rec = synchronized(audioRecordLock) { audioRecord } ?: break
                     if (rec !== recorder) break // Ownership changed
                     if (rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) break
@@ -827,18 +887,17 @@ class CoreVoiceService : Service(),
                     }
                     if (read != frameLength) continue
 
-                    if (serviceState == ServiceState.IDLE) {
-                        // Check Silero VAD score to gate CPU processing
-                        val vadScore = try { sileroVad?.isSpeech(buffer, SAMPLE_RATE) ?: -1f } catch (_: Exception) { -1f }
-                        if (vadScore >= 0.35f) {
-                            // Upgrade B1: Speculative pre-warming of Gemini 3.8 Live WebSocket on speech onset
-                            audioStreamer?.prewarm(backendWsUrl ?: "")
-                        }
+                    // Check Silero VAD score to gate CPU processing
+                    val vadScore = try { sileroVad?.isSpeech(buffer, SAMPLE_RATE) ?: -1f } catch (_: Exception) { -1f }
+                    if (vadScore >= 0.35f) {
+                        // Upgrade B1: Speculative pre-warming of Gemini 3.8 Live WebSocket on speech onset
+                        audioStreamer?.prewarm(backendWsUrl ?: "")
+                    }
 
-                        if (wakeWordManager?.process(buffer) == true) {
-                            Log.i(TAG, "Wake word detected by ${wakeWordManager?.getActiveEngineName()}")
-                            onWakeWordDetected()
-                        }
+                    if (wakeWordManager?.process(buffer) == true) {
+                        Log.i(TAG, "Wake word detected by ${wakeWordManager?.getActiveEngineName()}")
+                        onWakeWordDetected()
+                        break
                     }
                 }
 
@@ -856,12 +915,25 @@ class CoreVoiceService : Service(),
 
     private fun onWakeWordDetected(directCommand: String? = null) {
         val nowMs = SystemClock.elapsedRealtime()
+
+        // Siri-like: If assistant is currently speaking, user saying "Hey Bro" interrupts immediately!
+        if (serviceState == ServiceState.SPEAKING) {
+            Log.i(TAG, "Siri-style interruption: stopping speech on wake phrase")
+            ttsEngine.stop()
+            audioStreamer?.interruptPlayback()
+            resetToIdle()
+            mainHandler.postDelayed({
+                onWakeWordDetected(directCommand)
+            }, 100L)
+            return
+        }
+
         if (serviceState != ServiceState.IDLE) return
-        if (nowMs - lastWakeAtMs < 3_000L) {
+        if (nowMs - lastWakeAtMs < 1200L) {
             Log.d(TAG, "Wake cooldown active; ignoring extra trigger")
             return
         }
-        if (nowMs - lastFailedListenAtMs < 3_000L) {
+        if (nowMs - lastFailedListenAtMs < 1200L) {
             Log.d(TAG, "Recent STT failure cooldown active; not re-triggering wake detection")
             return
         }
@@ -918,15 +990,8 @@ class CoreVoiceService : Service(),
             Log.w(TAG, "Failed to launch lockscreen overlay via PendingIntent: ${e.message}")
         }
 
-        val engineName = wakeWordManager?.getActiveEngineName() ?: ""
-        if (engineName.contains("Native", ignoreCase = true) ||
-            engineName.contains("ViolaWake", ignoreCase = true) ||
-            engineName.contains("HeyBroPhraseWakeEngine", ignoreCase = true)) {
-            try {
-                wakeWordManager?.release()
-            } catch (_: Exception) {}
-            activeEngineName = "None"
-        }
+        // Reset wake engine internal state without destroying it!
+        (wakeWordManager?.activeEngine as? HeyBroPhraseWakeEngine)?.resetState()
 
         // Fast-path: if the user spoken a complete command along with the wake phrase
         // (e.g. "Hey bro turn on flashlight"), execute it immediately without interrupting
@@ -946,20 +1011,17 @@ class CoreVoiceService : Service(),
         pushEvent(mapOf("state" to "LISTENING", "activeEngine" to activeEngineName))
         updateNotification("I'm listening…")
 
-        val greetings = listOf(
-            "Hi Sandip, what can I do for you?",
-            "Hey Sandip, how can I help?",
-            "I'm listening, Sandip.",
-            "What's up, Sandip?"
-        )
-        
-        awaitingCommandAfterAck = true
-        val ackDelay = prefs.getLong("stt_ack_ms", 100L)
-        mainHandler.postDelayed({
-            if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
-                ttsEngine.speak(greetings.random())
-            }
-        }, ackDelay)
+        // Siri-like: Do not speak an interrupting greeting ("Hi Sandip, what can I do for you?").
+        // Speaking a greeting causes acoustic echo that blocks the mic from hearing the user!
+        // Instead, the subtle haptic feedback + Siri glowing orb on screen indicates readiness,
+        // and we immediately start recording the user's speech!
+        requestAudioFocus()
+        if (audioStreamer?.isConnected() == true) {
+            audioStreamer?.sendWakeWordTriggered()
+            captureAndSendAudio()
+        } else {
+            sttEngine.startListening()
+        }
     }
 
     fun manualTrigger() {
@@ -968,7 +1030,7 @@ class CoreVoiceService : Service(),
             onWakeWordDetected()
         } else if (serviceState == ServiceState.LISTENING) {
             Log.d(TAG, "Manual push-to-talk restart")
-            captureJob?.cancel()
+            stopCaptureAudio()
             if (audioStreamer?.isConnected() == true) {
                 audioStreamer?.sendWakeWordTriggered()
                 requestAudioFocus()
@@ -979,31 +1041,26 @@ class CoreVoiceService : Service(),
             }
         } else if (serviceState == ServiceState.SPEAKING) {
             ttsEngine.stop()
+            audioStreamer?.interruptPlayback()
             resetToIdle()
             mainHandler.postDelayed({
                 onWakeWordDetected()
-            }, 200)
+            }, 100L)
         }
     }
 
     private fun resetToIdle() {
+        cancelStateWatchdog()
         transitionTo(ServiceState.IDLE)
         sileroVad?.resetStates()
-        captureJob?.cancel()
+        stopCaptureAudio()
         sttEngine.stopListening()
+        releaseWakeRecorder()
 
-        synchronized(audioRecordLock) {
-            val rec = audioRecord
-            if (rec != null && rec.state == AudioRecord.STATE_INITIALIZED && rec.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-                try { rec.startRecording() } catch (_: Throwable) {}
-            }
-        }
+        (wakeWordManager?.activeEngine as? HeyBroPhraseWakeEngine)?.resetState()
 
-        if (wakeWordManager?.activeEngine == null) {
-            mainHandler.postDelayed({
-                scheduleWakeReinit()
-            }, 300)
-        }
+        mainHandler.removeCallbacks(startWakeWordRunnable)
+        mainHandler.postDelayed(startWakeWordRunnable, 250L)
 
         updateNotification("Say \"Hey Bro\" to activate")
     }
@@ -1038,6 +1095,12 @@ class CoreVoiceService : Service(),
     private fun transitionTo(newState: ServiceState) {
         Log.d(TAG, "State: $serviceState → $newState")
         serviceState = newState
+        when (newState) {
+            ServiceState.IDLE -> cancelStateWatchdog()
+            ServiceState.LISTENING -> scheduleStateWatchdog(10_000L, ServiceState.LISTENING)
+            ServiceState.PROCESSING -> scheduleStateWatchdog(12_000L, ServiceState.PROCESSING)
+            ServiceState.SPEAKING -> scheduleStateWatchdog(20_000L, ServiceState.SPEAKING)
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1071,7 +1134,7 @@ class CoreVoiceService : Service(),
 
     @SuppressLint("MissingPermission")
     private fun captureAndSendAudio() {
-        captureJob?.cancel()
+        stopCaptureAudio()
         captureJob = scope.launch {
             var recorder: AudioRecord? = null
             var noiseSuppressor: NoiseSuppressor? = null
@@ -1086,7 +1149,14 @@ class CoreVoiceService : Service(),
                 val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
                 val bufSize = maxOf(minBuf, frameSize * 4)
 
-                val createdRecorder = createAudioRecord(sampleRate, bufSize)
+                var createdRecorder: AudioRecord? = null
+                for (attempt in 1..3) {
+                    if (!isActive || serviceState != ServiceState.LISTENING) return@launch
+                    createdRecorder = createAudioRecord(sampleRate, bufSize)
+                    if (createdRecorder != null) break
+                    delay(80L * attempt)
+                }
+
                 if (createdRecorder == null) {
                     Log.e(TAG, "Capture audio: failed to initialize AudioRecord; falling back to local STT")
                     if (!serviceDestroyed && serviceState == ServiceState.LISTENING) {
@@ -1096,6 +1166,7 @@ class CoreVoiceService : Service(),
                     return@launch
                 }
                 recorder = createdRecorder
+                captureAudioRecord = createdRecorder
 
                 try {
                     val sessionId = recorder.audioSessionId
@@ -1289,6 +1360,9 @@ class CoreVoiceService : Service(),
                         }
                     } catch (_: Throwable) {}
                     try { recToRelease.release() } catch (_: Throwable) {}
+                }
+                if (captureAudioRecord === recorder) {
+                    captureAudioRecord = null
                 }
                 captureJob = null
             }
