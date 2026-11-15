@@ -168,23 +168,32 @@ class LocalSttEngine(private val context: Context) {
 
     // ── Private ───────────────────────────────────────────────────────────────
 
+    private var forceSystemRecognizer = false
+
     private fun recreateRecognizerLocked() {
         try {
             recognizer?.destroy()
         } catch (_: Exception) {}
+
+        val isOemRestricted = android.os.Build.MANUFACTURER.lowercase().let {
+            it.contains("vivo") || it.contains("oppo") || it.contains("xiaomi") ||
+            it.contains("oneplus") || it.contains("realme") || it.contains("huawei") || it.contains("honor")
+        }
         
         recognizer = try {
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S &&
+            if (!forceSystemRecognizer && !isOemRestricted &&
+                android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S &&
                 SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
             ) {
                 Log.i(TAG, "Creating on-device SpeechRecognizer")
                 SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
             } else {
-                Log.i(TAG, "Creating system SpeechRecognizer")
+                Log.i(TAG, "Creating system SpeechRecognizer (OEM: ${android.os.Build.MANUFACTURER})")
                 SpeechRecognizer.createSpeechRecognizer(context)
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to create specialized recognizer, falling back to default: ${e.message}")
+            forceSystemRecognizer = true
             SpeechRecognizer.createSpeechRecognizer(context)
         }
         
@@ -287,6 +296,7 @@ class LocalSttEngine(private val context: Context) {
 
             // Error 11 = ERROR_SERVER_DISCONNECTED, 8 = ERROR_RECOGNIZER_BUSY, 5 = ERROR_CLIENT
             if (error == 11 || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY || error == SpeechRecognizer.ERROR_CLIENT) {
+                forceSystemRecognizer = true
                 if (internalRetryCount < 2) {
                     internalRetryCount++
                     val delayMs = 400L * internalRetryCount

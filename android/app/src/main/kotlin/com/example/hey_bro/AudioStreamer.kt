@@ -50,6 +50,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
         val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
         const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
+        private val END_OF_TURN_MARKER = ByteArray(0)
     }
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
@@ -89,6 +90,8 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
     fun isConnected(): Boolean =
         isConnected.get() && (!isGeminiLive || setupComplete.get())
+
+    fun isConnecting(): Boolean = isConnecting.get()
     private var retryCount = 0
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -116,6 +119,23 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
             while (audioWriterRunning) {
                 try {
                     val data = audioQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    if (data.isEmpty()) {
+                        // End of turn marker: all audio chunks have been written to AudioTrack!
+                        synchronized(audioTrackLock) {
+                            val track = audioTrack
+                            if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
+                                try {
+                                    Thread.sleep(250) // Allow internal audio buffer to drain to speaker
+                                } catch (_: InterruptedException) {}
+                            }
+                        }
+                        stopAudioTrack()
+                        mainHandler.post {
+                            listener.onResponseComplete()
+                        }
+                        continue
+                    }
+
                     synchronized(audioTrackLock) {
                         val track = audioTrack
                         if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
@@ -158,6 +178,21 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     fun connect(urlOrApiKey: String) {
+        val trimmed = urlOrApiKey.trim()
+        if (trimmed.isBlank()) return
+
+        val targetUrl = if (trimmed.startsWith("ws://") || trimmed.startsWith("wss://")) {
+            trimmed
+        } else {
+            "$GEMINI_LIVE_BASE_URL?key=$trimmed"
+        }
+
+        // If we already have an active or connecting socket to this exact URL, do not sever it!
+        if (targetUrl == wsUrl && (isConnected.get() || isConnecting.get()) && webSocket != null) {
+            Log.d(TAG, "Already connected/connecting to $wsUrl; maintaining socket")
+            return
+        }
+
         mainHandler.removeCallbacks(idleCheckRunnable)
         mainHandler.postDelayed(idleCheckRunnable, 5000L)
         isConnecting.set(true)
@@ -167,13 +202,10 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         webSocket?.close(1000, "Backend changed")
         webSocket = null
 
-        if (urlOrApiKey.startsWith("ws://") || urlOrApiKey.startsWith("wss://")) {
-            wsUrl = urlOrApiKey
-            isGeminiLive = urlOrApiKey.contains("googleapis.com")
-        } else {
-            apiKey = urlOrApiKey.trim()
-            wsUrl = "$GEMINI_LIVE_BASE_URL?key=$apiKey"
-            isGeminiLive = true
+        wsUrl = targetUrl
+        isGeminiLive = targetUrl.contains("googleapis.com")
+        if (!trimmed.startsWith("ws://") && !trimmed.startsWith("wss://")) {
+            apiKey = trimmed
         }
 
         retryCount = 0
@@ -233,6 +265,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     fun flushAndPauseAudio() {
+        audioQueue.clear()
         synchronized(audioTrackLock) {
             try {
                 if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
@@ -789,9 +822,13 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     private fun handleResponseComplete() {
-        mainHandler.postDelayed({
-            stopAudioTrack()
-        }, 250)
-        listener.onResponseComplete()
+        if (audioQueue.isEmpty() && !isTtsActive.get()) {
+            mainHandler.post {
+                stopAudioTrack()
+                listener.onResponseComplete()
+            }
+        } else {
+            audioQueue.offer(END_OF_TURN_MARKER)
+        }
     }
 }

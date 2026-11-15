@@ -414,7 +414,7 @@ class CoreVoiceService : Service(),
         }
 
         val targetUrl = if (apiKey.isNotBlank() && (trimmed.isBlank() || trimmed.contains("googleapis.com"))) {
-            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+            "$DEFAULT_BACKEND_WS?key=$apiKey"
         } else if (trimmed.isNotBlank()) {
             if (trimmed.contains("googleapis.com")) {
                 if (apiKey.isNotBlank()) {
@@ -426,9 +426,14 @@ class CoreVoiceService : Service(),
                 trimmed
             }
         } else if (apiKey.isNotBlank()) {
-            "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey"
+            "$DEFAULT_BACKEND_WS?key=$apiKey"
         } else {
             DEFAULT_BACKEND_WS
+        }
+
+        if (targetUrl == backendWsUrl && (audioStreamer?.isConnected() == true || audioStreamer?.isConnecting() == true)) {
+            Log.d(TAG, "Backend already active: $targetUrl")
+            return
         }
 
         backendWsUrl = targetUrl
@@ -441,9 +446,19 @@ class CoreVoiceService : Service(),
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
-            val saved = prefs.getString(KEY_BACKEND_WS, DEFAULT_BACKEND_WS)
-            val current = backendWsUrl ?: ""
-            if (saved != null && saved.trim() != current) {
+            val saved = prefs.getString(KEY_BACKEND_WS, DEFAULT_BACKEND_WS)?.trim() ?: DEFAULT_BACKEND_WS
+            val apiKey = prefs.getString("gemini_api_key", "")?.trim().let { if (it.isNullOrBlank()) DEFAULT_GEMINI_KEY else it }
+            val expectedTarget = if (apiKey.isNotBlank() && (saved.isBlank() || saved.contains("googleapis.com"))) {
+                "$DEFAULT_BACKEND_WS?key=$apiKey"
+            } else if (saved.isNotBlank()) {
+                if (saved.contains("googleapis.com") && apiKey.isNotBlank() && !saved.contains("key=")) {
+                    "$saved?key=$apiKey"
+                } else saved
+            } else {
+                DEFAULT_BACKEND_WS
+            }
+
+            if (expectedTarget != backendWsUrl) {
                 applyBackendWs(saved)
             }
         } catch (e: Exception) {
@@ -679,11 +694,15 @@ class CoreVoiceService : Service(),
             abandonAudioFocus()
 
             if (msg != null) {
+                transitionTo(ServiceState.SPEAKING)
+                overlayManager.show(OverlayManager.State.PLAYING, msg)
+                pushEvent(mapOf("state" to "PLAYING", "response" to msg))
                 ttsEngine.speak(msg)
+            } else {
+                resetToIdle()
+                pushEvent(mapOf("state" to "IDLE"))
+                overlayManager.hideDelayed(800)
             }
-            resetToIdle()
-            pushEvent(mapOf("state" to "IDLE"))
-            overlayManager.hideDelayed(800)
             sttFailureCount = 0
         }
     }
@@ -1028,7 +1047,7 @@ class CoreVoiceService : Service(),
         // Instead, the subtle haptic feedback + Siri glowing orb on screen indicates readiness,
         // and we immediately start recording the user's speech!
         requestAudioFocus()
-        if (audioStreamer?.isConnected() == true) {
+        if (audioStreamer?.isConnected() == true || audioStreamer?.isConnecting() == true) {
             audioStreamer?.sendWakeWordTriggered()
             captureAndSendAudio()
         } else {
@@ -1236,12 +1255,29 @@ class CoreVoiceService : Service(),
 
                 Log.d(TAG, "Dynamic crystal-clear capture engine started")
 
+                val connectGraceMs = 500L
                 while (isActive && SystemClock.elapsedRealtime() - startMs < maxDurationMs) {
                     if (audioStreamer?.isConnected() != true) {
-                        Log.w(TAG, "Socket dropped during capture; instant fallback to on-device STT")
-                        requestAudioFocus()
-                        try { sttEngine.startListening() } catch (_: Exception) {}
-                        return@launch
+                        if (audioStreamer?.isConnecting() == true && (SystemClock.elapsedRealtime() - startMs) < connectGraceMs) {
+                            val r = recorder.read(shortBuf, 0, frameSize)
+                            if (r > 0) {
+                                val bytes = ByteArray(r * 2)
+                                var bi = 0
+                                for (i in 0 until r) {
+                                    val s = shortBuf[i]
+                                    bytes[bi++] = (s.toInt() and 0xFF).toByte()
+                                    bytes[bi++] = ((s.toInt() shr 8) and 0xFF).toByte()
+                                }
+                                if (preRollBuffer.size >= 12) preRollBuffer.removeFirst()
+                                preRollBuffer.addLast(bytes)
+                            }
+                            continue
+                        } else {
+                            Log.w(TAG, "Socket unavailable during capture; instant fallback to on-device STT")
+                            requestAudioFocus()
+                            try { sttEngine.startListening() } catch (_: Exception) {}
+                            return@launch
+                        }
                     }
 
                     val r = recorder.read(shortBuf, 0, frameSize)

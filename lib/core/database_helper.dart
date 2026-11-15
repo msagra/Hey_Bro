@@ -31,76 +31,352 @@ class DatabaseHelper {
   }
 
   static const List<Map<String, String>> defaultShortcuts = [
-    {'trigger_phrase': 'torch', 'target_type': 'system', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'flash', 'target_type': 'system', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'turn on flashlight', 'target_type': 'system', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'turn off flashlight', 'target_type': 'system', 'target_value': 'flashlightOff'},
-    {'trigger_phrase': 'flashlight on', 'target_type': 'system', 'target_value': 'flashlightOn'},
-    {'trigger_phrase': 'flashlight off', 'target_type': 'system', 'target_value': 'flashlightOff'},
-    {'trigger_phrase': 'torch off', 'target_type': 'system', 'target_value': 'flashlightOff'},
-    {'trigger_phrase': 'silence phone', 'target_type': 'system', 'target_value': 'mute'},
+    {
+      'trigger_phrase': 'torch',
+      'target_type': 'system',
+      'target_value': 'flashlightOn',
+    },
+    {
+      'trigger_phrase': 'flash',
+      'target_type': 'system',
+      'target_value': 'flashlightOn',
+    },
+    {
+      'trigger_phrase': 'turn on flashlight',
+      'target_type': 'system',
+      'target_value': 'flashlightOn',
+    },
+    {
+      'trigger_phrase': 'turn off flashlight',
+      'target_type': 'system',
+      'target_value': 'flashlightOff',
+    },
+    {
+      'trigger_phrase': 'flashlight on',
+      'target_type': 'system',
+      'target_value': 'flashlightOn',
+    },
+    {
+      'trigger_phrase': 'flashlight off',
+      'target_type': 'system',
+      'target_value': 'flashlightOff',
+    },
+    {
+      'trigger_phrase': 'torch off',
+      'target_type': 'system',
+      'target_value': 'flashlightOff',
+    },
+    {
+      'trigger_phrase': 'silence phone',
+      'target_type': 'system',
+      'target_value': 'mute',
+    },
     {'trigger_phrase': 'mute', 'target_type': 'system', 'target_value': 'mute'},
-    {'trigger_phrase': 'volume up', 'target_type': 'system', 'target_value': 'volumeUp'},
-    {'trigger_phrase': 'volume down', 'target_type': 'system', 'target_value': 'volumeDown'},
-    {'trigger_phrase': 'louder', 'target_type': 'system', 'target_value': 'volumeUp'},
-    {'trigger_phrase': 'quieter', 'target_type': 'system', 'target_value': 'volumeDown'},
-    {'trigger_phrase': 'take a selfie', 'target_type': 'system', 'target_value': 'takeSelfie'},
-    {'trigger_phrase': 'front camera', 'target_type': 'system', 'target_value': 'takeSelfie'},
-    {'trigger_phrase': 'take photo', 'target_type': 'system', 'target_value': 'takePhoto'},
-    {'trigger_phrase': 'open camera', 'target_type': 'system', 'target_value': 'openCamera'},
-    {'trigger_phrase': 'screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
-    {'trigger_phrase': 'take screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
-    {'trigger_phrase': 'lock screen', 'target_type': 'system', 'target_value': 'lockScreen'},
-    {'trigger_phrase': 'stop listening', 'target_type': 'system', 'target_value': 'sleep'},
-    {'trigger_phrase': 'go to sleep', 'target_type': 'system', 'target_value': 'sleep'},
-    {'trigger_phrase': 'battery saver', 'target_type': 'system', 'target_value': 'batterySaver'},
-    {'trigger_phrase': 'do not disturb', 'target_type': 'system', 'target_value': 'doNotDisturb'},
-    {'trigger_phrase': 'show notifications', 'target_type': 'system', 'target_value': 'notifications'},
-    {'trigger_phrase': 'quick settings', 'target_type': 'system', 'target_value': 'quickSettings'},
-    {'trigger_phrase': 'recent apps', 'target_type': 'system', 'target_value': 'recents'},
-    {'trigger_phrase': 'go home', 'target_type': 'system', 'target_value': 'globalHome'},
-    {'trigger_phrase': 'go back', 'target_type': 'system', 'target_value': 'globalBack'},
-    {'trigger_phrase': 'play music', 'target_type': 'system', 'target_value': 'mediaPlayPause'},
-    {'trigger_phrase': 'pause music', 'target_type': 'system', 'target_value': 'mediaPlayPause'},
-    {'trigger_phrase': 'resume music', 'target_type': 'system', 'target_value': 'mediaPlayPause'},
-    {'trigger_phrase': 'next song', 'target_type': 'system', 'target_value': 'mediaNext'},
-    {'trigger_phrase': 'previous song', 'target_type': 'system', 'target_value': 'mediaPrevious'},
-    {'trigger_phrase': 'turn on wifi', 'target_type': 'system', 'target_value': 'toggleWifi'},
-    {'trigger_phrase': 'turn off wifi', 'target_type': 'system', 'target_value': 'toggleWifi'},
-    {'trigger_phrase': 'toggle wifi', 'target_type': 'system', 'target_value': 'toggleWifi'},
-    {'trigger_phrase': 'turn on bluetooth', 'target_type': 'system', 'target_value': 'toggleBluetooth'},
-    {'trigger_phrase': 'turn off bluetooth', 'target_type': 'system', 'target_value': 'toggleBluetooth'},
-    {'trigger_phrase': 'toggle bluetooth', 'target_type': 'system', 'target_value': 'toggleBluetooth'},
-    {'trigger_phrase': 'turn on hotspot', 'target_type': 'system', 'target_value': 'toggleHotspot'},
-    {'trigger_phrase': 'turn off hotspot', 'target_type': 'system', 'target_value': 'toggleHotspot'},
-    {'trigger_phrase': 'airplane mode', 'target_type': 'system', 'target_value': 'toggleAirplaneMode'},
-    {'trigger_phrase': 'open maps', 'target_type': 'system', 'target_value': 'openMaps'},
-    {'trigger_phrase': 'open whatsapp', 'target_type': 'system', 'target_value': 'openApp:com.whatsapp'},
-    {'trigger_phrase': 'open youtube', 'target_type': 'system', 'target_value': 'openApp:com.google.android.youtube'},
-    {'trigger_phrase': 'open spotify', 'target_type': 'system', 'target_value': 'openApp:com.spotify.music'},
-    {'trigger_phrase': 'open chrome', 'target_type': 'system', 'target_value': 'openApp:com.android.chrome'},
-    {'trigger_phrase': 'open instagram', 'target_type': 'system', 'target_value': 'openApp:com.instagram.android'},
-    {'trigger_phrase': 'open telegram', 'target_type': 'system', 'target_value': 'openApp:org.telegram.messenger'},
-    {'trigger_phrase': 'open settings', 'target_type': 'system', 'target_value': 'openSettings'},
-    {'trigger_phrase': 'open calculator', 'target_type': 'system', 'target_value': 'openApp:com.google.android.calculator'},
-    {'trigger_phrase': 'open calendar', 'target_type': 'system', 'target_value': 'openApp:com.google.android.calendar'},
-    {'trigger_phrase': 'open clock', 'target_type': 'system', 'target_value': 'openApp:com.google.android.deskclock'},
-    {'trigger_phrase': 'open gmail', 'target_type': 'system', 'target_value': 'openApp:com.google.android.gm'},
-    {'trigger_phrase': 'open gallery', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.photos'},
-    {'trigger_phrase': 'open phone', 'target_type': 'system', 'target_value': 'openApp:com.google.android.dialer'},
-    {'trigger_phrase': 'open messages', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.messaging'},
-    {'trigger_phrase': 'open dialer', 'target_type': 'system', 'target_value': 'openApp:com.google.android.dialer'},
-    {'trigger_phrase': 'open files', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.files'},
-    {'trigger_phrase': 'open netflix', 'target_type': 'system', 'target_value': 'openApp:com.netflix.mediaclient'},
-    {'trigger_phrase': 'open uber', 'target_type': 'system', 'target_value': 'openApp:com.ubercab'},
-    {'trigger_phrase': 'open zomato', 'target_type': 'system', 'target_value': 'openApp:com.application.zomato'},
-    {'trigger_phrase': 'open swiggy', 'target_type': 'system', 'target_value': 'openApp:in.swiggy.android'},
-    {'trigger_phrase': 'open amazon', 'target_type': 'system', 'target_value': 'openApp:in.amazon.mShop.android.shopping'},
-    {'trigger_phrase': 'open flipkart', 'target_type': 'system', 'target_value': 'openApp:com.flipkart.android'},
-    {'trigger_phrase': 'open paytm', 'target_type': 'system', 'target_value': 'openApp:net.one97.paytm'},
-    {'trigger_phrase': 'open gpay', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.paisa.user'},
-    {'trigger_phrase': 'open google pay', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.paisa.user'},
-    {'trigger_phrase': 'open phonepe', 'target_type': 'system', 'target_value': 'openApp:com.phonepe.app'},
+    {
+      'trigger_phrase': 'volume up',
+      'target_type': 'system',
+      'target_value': 'volumeUp',
+    },
+    {
+      'trigger_phrase': 'volume down',
+      'target_type': 'system',
+      'target_value': 'volumeDown',
+    },
+    {
+      'trigger_phrase': 'louder',
+      'target_type': 'system',
+      'target_value': 'volumeUp',
+    },
+    {
+      'trigger_phrase': 'quieter',
+      'target_type': 'system',
+      'target_value': 'volumeDown',
+    },
+    {
+      'trigger_phrase': 'take a selfie',
+      'target_type': 'system',
+      'target_value': 'takeSelfie',
+    },
+    {
+      'trigger_phrase': 'front camera',
+      'target_type': 'system',
+      'target_value': 'takeSelfie',
+    },
+    {
+      'trigger_phrase': 'take photo',
+      'target_type': 'system',
+      'target_value': 'takePhoto',
+    },
+    {
+      'trigger_phrase': 'open camera',
+      'target_type': 'system',
+      'target_value': 'openCamera',
+    },
+    {
+      'trigger_phrase': 'screenshot',
+      'target_type': 'system',
+      'target_value': 'screenshot',
+    },
+    {
+      'trigger_phrase': 'take screenshot',
+      'target_type': 'system',
+      'target_value': 'screenshot',
+    },
+    {
+      'trigger_phrase': 'lock screen',
+      'target_type': 'system',
+      'target_value': 'lockScreen',
+    },
+    {
+      'trigger_phrase': 'stop listening',
+      'target_type': 'system',
+      'target_value': 'sleep',
+    },
+    {
+      'trigger_phrase': 'go to sleep',
+      'target_type': 'system',
+      'target_value': 'sleep',
+    },
+    {
+      'trigger_phrase': 'battery saver',
+      'target_type': 'system',
+      'target_value': 'batterySaver',
+    },
+    {
+      'trigger_phrase': 'do not disturb',
+      'target_type': 'system',
+      'target_value': 'doNotDisturb',
+    },
+    {
+      'trigger_phrase': 'show notifications',
+      'target_type': 'system',
+      'target_value': 'notifications',
+    },
+    {
+      'trigger_phrase': 'quick settings',
+      'target_type': 'system',
+      'target_value': 'quickSettings',
+    },
+    {
+      'trigger_phrase': 'recent apps',
+      'target_type': 'system',
+      'target_value': 'recents',
+    },
+    {
+      'trigger_phrase': 'go home',
+      'target_type': 'system',
+      'target_value': 'globalHome',
+    },
+    {
+      'trigger_phrase': 'go back',
+      'target_type': 'system',
+      'target_value': 'globalBack',
+    },
+    {
+      'trigger_phrase': 'play music',
+      'target_type': 'system',
+      'target_value': 'mediaPlayPause',
+    },
+    {
+      'trigger_phrase': 'pause music',
+      'target_type': 'system',
+      'target_value': 'mediaPlayPause',
+    },
+    {
+      'trigger_phrase': 'resume music',
+      'target_type': 'system',
+      'target_value': 'mediaPlayPause',
+    },
+    {
+      'trigger_phrase': 'next song',
+      'target_type': 'system',
+      'target_value': 'mediaNext',
+    },
+    {
+      'trigger_phrase': 'previous song',
+      'target_type': 'system',
+      'target_value': 'mediaPrevious',
+    },
+    {
+      'trigger_phrase': 'turn on wifi',
+      'target_type': 'system',
+      'target_value': 'toggleWifi',
+    },
+    {
+      'trigger_phrase': 'turn off wifi',
+      'target_type': 'system',
+      'target_value': 'toggleWifi',
+    },
+    {
+      'trigger_phrase': 'toggle wifi',
+      'target_type': 'system',
+      'target_value': 'toggleWifi',
+    },
+    {
+      'trigger_phrase': 'turn on bluetooth',
+      'target_type': 'system',
+      'target_value': 'toggleBluetooth',
+    },
+    {
+      'trigger_phrase': 'turn off bluetooth',
+      'target_type': 'system',
+      'target_value': 'toggleBluetooth',
+    },
+    {
+      'trigger_phrase': 'toggle bluetooth',
+      'target_type': 'system',
+      'target_value': 'toggleBluetooth',
+    },
+    {
+      'trigger_phrase': 'turn on hotspot',
+      'target_type': 'system',
+      'target_value': 'toggleHotspot',
+    },
+    {
+      'trigger_phrase': 'turn off hotspot',
+      'target_type': 'system',
+      'target_value': 'toggleHotspot',
+    },
+    {
+      'trigger_phrase': 'airplane mode',
+      'target_type': 'system',
+      'target_value': 'toggleAirplaneMode',
+    },
+    {
+      'trigger_phrase': 'open maps',
+      'target_type': 'system',
+      'target_value': 'openMaps',
+    },
+    {
+      'trigger_phrase': 'open whatsapp',
+      'target_type': 'system',
+      'target_value': 'openApp:com.whatsapp',
+    },
+    {
+      'trigger_phrase': 'open youtube',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.youtube',
+    },
+    {
+      'trigger_phrase': 'open spotify',
+      'target_type': 'system',
+      'target_value': 'openApp:com.spotify.music',
+    },
+    {
+      'trigger_phrase': 'open chrome',
+      'target_type': 'system',
+      'target_value': 'openApp:com.android.chrome',
+    },
+    {
+      'trigger_phrase': 'open instagram',
+      'target_type': 'system',
+      'target_value': 'openApp:com.instagram.android',
+    },
+    {
+      'trigger_phrase': 'open telegram',
+      'target_type': 'system',
+      'target_value': 'openApp:org.telegram.messenger',
+    },
+    {
+      'trigger_phrase': 'open settings',
+      'target_type': 'system',
+      'target_value': 'openSettings',
+    },
+    {
+      'trigger_phrase': 'open calculator',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.calculator',
+    },
+    {
+      'trigger_phrase': 'open calendar',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.calendar',
+    },
+    {
+      'trigger_phrase': 'open clock',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.deskclock',
+    },
+    {
+      'trigger_phrase': 'open gmail',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.gm',
+    },
+    {
+      'trigger_phrase': 'open gallery',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.apps.photos',
+    },
+    {
+      'trigger_phrase': 'open phone',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.dialer',
+    },
+    {
+      'trigger_phrase': 'open messages',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.apps.messaging',
+    },
+    {
+      'trigger_phrase': 'open dialer',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.dialer',
+    },
+    {
+      'trigger_phrase': 'open files',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.apps.nbu.files',
+    },
+    {
+      'trigger_phrase': 'open netflix',
+      'target_type': 'system',
+      'target_value': 'openApp:com.netflix.mediaclient',
+    },
+    {
+      'trigger_phrase': 'open uber',
+      'target_type': 'system',
+      'target_value': 'openApp:com.ubercab',
+    },
+    {
+      'trigger_phrase': 'open zomato',
+      'target_type': 'system',
+      'target_value': 'openApp:com.application.zomato',
+    },
+    {
+      'trigger_phrase': 'open swiggy',
+      'target_type': 'system',
+      'target_value': 'openApp:in.swiggy.android',
+    },
+    {
+      'trigger_phrase': 'open amazon',
+      'target_type': 'system',
+      'target_value': 'openApp:in.amazon.mShop.android.shopping',
+    },
+    {
+      'trigger_phrase': 'open flipkart',
+      'target_type': 'system',
+      'target_value': 'openApp:com.flipkart.android',
+    },
+    {
+      'trigger_phrase': 'open paytm',
+      'target_type': 'system',
+      'target_value': 'openApp:net.one97.paytm',
+    },
+    {
+      'trigger_phrase': 'open gpay',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.apps.nbu.paisa.user',
+    },
+    {
+      'trigger_phrase': 'open google pay',
+      'target_type': 'system',
+      'target_value': 'openApp:com.google.android.apps.nbu.paisa.user',
+    },
+    {
+      'trigger_phrase': 'open phonepe',
+      'target_type': 'system',
+      'target_value': 'openApp:com.phonepe.app',
+    },
   ];
 
   Future<Database> _initDatabase() async {
@@ -173,7 +449,11 @@ class DatabaseHelper {
 
   // ── Conversation APIs ────────────────────────────────────────────────────────
 
-  Future<int> insertConversation(String role, String message, {String? actionJson}) async {
+  Future<int> insertConversation(
+    String role,
+    String message, {
+    String? actionJson,
+  }) async {
     final db = await database;
     return await db.insert('conversations', {
       'role': role,
@@ -199,26 +479,29 @@ class DatabaseHelper {
 
   // ── Custom Aliases APIs ──────────────────────────────────────────────────────
 
-  Future<int> insertAlias(String triggerPhrase, String targetType, String targetValue) async {
+  Future<int> insertAlias(
+    String triggerPhrase,
+    String targetType,
+    String targetValue,
+  ) async {
     final db = await database;
     final type = targetType.trim().isEmpty ? 'custom' : targetType.trim();
-    return await db.insert(
-      'custom_aliases',
-      {
-        'trigger_phrase': triggerPhrase.trim().toLowerCase(),
-        'target_type': type,
-        'target_value': targetValue.trim(),
-      },
-      conflictAlgorithm: ConflictAlgorithm.replace,
-    );
+    return await db.insert('custom_aliases', {
+      'trigger_phrase': triggerPhrase.trim().toLowerCase(),
+      'target_type': type,
+      'target_value': targetValue.trim(),
+    }, conflictAlgorithm: ConflictAlgorithm.replace);
   }
 
-  Future<List<Map<String, dynamic>>> getAliases({bool customFirst = true}) async {
+  Future<List<Map<String, dynamic>>> getAliases({
+    bool customFirst = true,
+  }) async {
     final db = await database;
     if (customFirst) {
       return await db.query(
         'custom_aliases',
-        orderBy: "CASE WHEN LOWER(target_type) = 'custom' THEN 0 ELSE 1 END, id DESC",
+        orderBy:
+            "CASE WHEN LOWER(target_type) = 'custom' THEN 0 ELSE 1 END, id DESC",
       );
     }
     return await db.query('custom_aliases', orderBy: 'trigger_phrase ASC');
@@ -262,7 +545,11 @@ class DatabaseHelper {
 
   // ── Command Logs APIs ────────────────────────────────────────────────────────
 
-  Future<int> logCommand(String command, String status, int executionTimeMs) async {
+  Future<int> logCommand(
+    String command,
+    String status,
+    int executionTimeMs,
+  ) async {
     final db = await database;
     return await db.insert('command_logs', {
       'command': command,

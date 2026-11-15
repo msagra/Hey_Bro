@@ -898,10 +898,18 @@ class _DashboardScreenState extends State<DashboardScreen>
         return StatefulBuilder(
           builder: (ctx, setModalState) {
             final customCount = aliases
-                .where((a) => a['target_type']?.toString().toLowerCase() == 'custom')
+                .where(
+                  (a) => a['target_type']?.toString().toLowerCase() == 'custom',
+                )
                 .length;
             final displayedAliases = filterOnlyCustom
-                ? aliases.where((a) => a['target_type']?.toString().toLowerCase() == 'custom').toList()
+                ? aliases
+                      .where(
+                        (a) =>
+                            a['target_type']?.toString().toLowerCase() ==
+                            'custom',
+                      )
+                      .toList()
                 : aliases;
 
             return Padding(
@@ -1729,7 +1737,11 @@ class _DashboardScreenState extends State<DashboardScreen>
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.star_rounded, size: 16, color: Color(0xFF00E5CC)),
+                    const Icon(
+                      Icons.star_rounded,
+                      size: 16,
+                      color: Color(0xFF00E5CC),
+                    ),
                     const SizedBox(width: 6),
                     Text(
                       'My Custom Shortcuts (${customList.length})',
@@ -1743,13 +1755,20 @@ class _DashboardScreenState extends State<DashboardScreen>
                 ),
                 TextButton.icon(
                   onPressed: _openAliasesDialog,
-                  icon: const Icon(Icons.add_rounded, size: 15, color: Color(0xFF00E5CC)),
+                  icon: const Icon(
+                    Icons.add_rounded,
+                    size: 15,
+                    color: Color(0xFF00E5CC),
+                  ),
                   label: const Text(
                     'Add New',
                     style: TextStyle(fontSize: 12, color: Color(0xFF00E5CC)),
                   ),
                   style: TextButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
                     minimumSize: Size.zero,
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                   ),
@@ -1823,7 +1842,11 @@ class _DashboardScreenState extends State<DashboardScreen>
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.flash_on_rounded, size: 16, color: Color(0xFF00E5CC)),
+                    const Icon(
+                      Icons.flash_on_rounded,
+                      size: 16,
+                      color: Color(0xFF00E5CC),
+                    ),
                     const SizedBox(width: 8),
                     const Expanded(
                       child: Text(
@@ -1839,14 +1862,23 @@ class _DashboardScreenState extends State<DashboardScreen>
                       onTap: _openAliasesDialog,
                       borderRadius: BorderRadius.circular(8),
                       child: Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 8,
+                          vertical: 4,
+                        ),
                         decoration: BoxDecoration(
-                          color: const Color(0xFF00E5CC).withValues(alpha: 0.15),
+                          color: const Color(
+                            0xFF00E5CC,
+                          ).withValues(alpha: 0.15),
                           borderRadius: BorderRadius.circular(8),
                         ),
                         child: const Text(
                           '+ Add Custom',
-                          style: TextStyle(fontSize: 11, color: Color(0xFF00E5CC), fontWeight: FontWeight.bold),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Color(0xFF00E5CC),
+                            fontWeight: FontWeight.bold,
+                          ),
                         ),
                       ),
                     ),

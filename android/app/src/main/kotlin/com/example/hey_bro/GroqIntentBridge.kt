@@ -90,6 +90,7 @@ class GroqIntentBridge(private val context: Context) {
                     setRequestProperty("Authorization", "Bearer $apiKey")
                     setRequestProperty("Content-Type", "application/json")
                     setRequestProperty("Accept", "application/json")
+                    setRequestProperty("User-Agent", "HeyBroAssistant/1.0")
                 }
 
                 conn.outputStream.use { out ->
