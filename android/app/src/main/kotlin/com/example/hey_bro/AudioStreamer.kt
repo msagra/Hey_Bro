@@ -48,15 +48,15 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         private val RETRY_DELAYS_MS = longArrayOf(500, 1_000, 2_000, 4_000, 6_000, 10_000)
         private const val GEMINI_LIVE_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-2.5-flash" }
-        const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash"
+        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
+        const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
     }
 
     // ── WebSocket ─────────────────────────────────────────────────────────────
     private var webSocket: WebSocket? = null
     private var wsUrl: String = ""
     private var apiKey: String = ""
-    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-2.5-flash" }
+    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
     private val isConnected = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
     private val setupComplete = AtomicBoolean(false)
@@ -760,8 +760,8 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-            Log.e(TAG, "Gemini Live WebSocket failure: ${t.message}")
-            if (response?.code == 404 && activeLiveModel != FALLBACK_LIVE_MODEL) {
+            Log.e(TAG, "Gemini Live WebSocket failure: ${t.message} (HTTP ${response?.code})")
+            if ((response?.code == 404 || response?.code == 429) && activeLiveModel != FALLBACK_LIVE_MODEL) {
                 Log.w(TAG, "Attempting connection fallback from $activeLiveModel to $FALLBACK_LIVE_MODEL")
                 activeLiveModel = FALLBACK_LIVE_MODEL
             }
@@ -774,13 +774,17 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.i(TAG, "Gemini Live WebSocket closed ($code): $reason")
-            if (code == 1008 && activeLiveModel != FALLBACK_LIVE_MODEL) {
-                Log.w(TAG, "Policy violation 1008; switching to fallback model: $FALLBACK_LIVE_MODEL")
-                activeLiveModel = FALLBACK_LIVE_MODEL
-            }
+            val wasConnected = isConnected.get()
             isConnected.set(false)
             isConnecting.set(false)
+            setupComplete.set(false)
             listener.onConnectionStateChanged(false)
+
+            if ((code == 1008 || code == 1011) && activeLiveModel != FALLBACK_LIVE_MODEL) {
+                Log.w(TAG, "Quota or policy closure ($code); attempting fallback to $FALLBACK_LIVE_MODEL")
+                activeLiveModel = FALLBACK_LIVE_MODEL
+                scheduleReconnect()
+            }
         }
     }
 

@@ -108,13 +108,10 @@ class HeyBroPhraseWakeEngine(private val context: Context) : IWakeWordEngine {
                     consecutiveSpeechFrames >= 8
                 ) {
                     val now = System.currentTimeMillis()
-                    if (now - lastWakeTimeMs > 1200L) {
+                    if (now - lastWakeTimeMs > 750L) {
                         lastWakeTimeMs = now
                         Log.i(TAG, "Acoustic wake pattern confirmed: duration=${totalUtteranceFrames * 32}ms, peaks=$peakCount, vad=$vadScore")
                         resetState()
-                        mainHandler.post {
-                            callback?.invoke(null)
-                        }
                         return true
                     }
                 }

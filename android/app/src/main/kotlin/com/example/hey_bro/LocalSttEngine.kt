@@ -33,6 +33,8 @@ class LocalSttEngine(private val context: Context) {
     private var recognizer: SpeechRecognizer? = null
     private var listener: Listener? = null
     @Volatile private var destroyed = false
+    @Volatile private var isExplicitlyStopped = true
+    private var pendingRetryRunnable: Runnable? = null
 
     // ── State flags (accessed only on main thread) ────────────────────────────
     private var isListening = false
@@ -49,7 +51,7 @@ class LocalSttEngine(private val context: Context) {
     // Track whether this listening session was initiated after TTS to apply extra settling delay
     @Volatile private var postTtsStart = false
     private val watchdogRunnable = Runnable {
-        if (isListening && System.currentTimeMillis() - listenStartMs >= MAX_LISTEN_MS) {
+        if (isListening && !isExplicitlyStopped && System.currentTimeMillis() - listenStartMs >= MAX_LISTEN_MS) {
             Log.w(TAG, "Watchdog: listening timeout; cancelling recognizer")
             try {
                 recognizer?.cancel()
@@ -59,8 +61,17 @@ class LocalSttEngine(private val context: Context) {
         }
     }
 
+    private fun cancelPendingRetry() {
+        pendingRetryRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            pendingRetryRunnable = null
+        }
+    }
+
     fun initialize(listener: Listener) {
         destroyed = false
+        isExplicitlyStopped = true
+        cancelPendingRetry()
         this.listener = listener
         mainHandler.post {
             if (destroyed) return@post
@@ -77,13 +88,15 @@ class LocalSttEngine(private val context: Context) {
     /** Must be safe to call from any thread — dispatched to main internally. */
     fun startListening() {
         if (destroyed) return
+        isExplicitlyStopped = false
+        cancelPendingRetry()
         mainHandler.post {
-            if (destroyed) return@post
+            if (destroyed || isExplicitlyStopped) return@post
             if (!isInitialized || recognizer == null) {
                 Log.w(TAG, "startListening called before init – reinitializing")
                 listener?.let { initialize(it) }
                 mainHandler.postDelayed({
-                    if (!destroyed) startListeningOnMain()
+                    if (!destroyed && !isExplicitlyStopped) startListeningOnMain()
                 }, 500)
                 return@post
             }
@@ -95,12 +108,14 @@ class LocalSttEngine(private val context: Context) {
     /** Start listening with a small pipeline-settling delay (use after TTS playback). */
     fun startListeningPostTts(delayMs: Long = 200L) {
         if (destroyed) return
+        isExplicitlyStopped = false
+        cancelPendingRetry()
         mainHandler.post {
-            if (destroyed) return@post
+            if (destroyed || isExplicitlyStopped) return@post
             if (!isInitialized || recognizer == null) {
                 listener?.let { initialize(it) }
                 mainHandler.postDelayed({
-                    if (!destroyed) {
+                    if (!destroyed && !isExplicitlyStopped) {
                         postTtsStart = true
                         startListeningOnMain()
                     }
@@ -110,7 +125,7 @@ class LocalSttEngine(private val context: Context) {
             internalRetryCount = 0
             postTtsStart = true
             mainHandler.postDelayed({
-                if (!destroyed) startListeningOnMain()
+                if (!destroyed && !isExplicitlyStopped) startListeningOnMain()
             }, delayMs)
         }
     }
@@ -118,30 +133,36 @@ class LocalSttEngine(private val context: Context) {
     /** Must be safe to call from any thread. */
     fun stopListening() {
         if (destroyed) return
+        isExplicitlyStopped = true
+        cancelPendingRetry()
         mainHandler.post {
             if (destroyed) return@post
             startGeneration++
             internalRetryCount = 0
+            cancelPendingRetry()
+            mainHandler.removeCallbacks(watchdogRunnable)
             if (isListening) {
                 try { recognizer?.stopListening() } catch (_: Exception) {}
                 isListening = false
             }
             try { recognizer?.cancel() } catch (_: Exception) {}
-            mainHandler.removeCallbacks(watchdogRunnable)
         }
     }
 
     fun destroy() {
         destroyed = true
+        isExplicitlyStopped = true
+        cancelPendingRetry()
         mainHandler.post {
             startGeneration++
             internalRetryCount = 0
+            cancelPendingRetry()
+            mainHandler.removeCallbacks(watchdogRunnable)
             try { recognizer?.stopListening() } catch (_: Exception) {}
             try { recognizer?.destroy() } catch (_: Exception) {}
             recognizer = null
             isListening = false
             isInitialized = false
-            mainHandler.removeCallbacks(watchdogRunnable)
         }
     }
 
@@ -172,11 +193,18 @@ class LocalSttEngine(private val context: Context) {
     }
 
     private fun startListeningOnMain() {
+        if (destroyed || isExplicitlyStopped) {
+            Log.d(TAG, "startListeningOnMain aborted: destroyed=$destroyed, isExplicitlyStopped=$isExplicitlyStopped")
+            return
+        }
+
         if (!SpeechRecognizer.isRecognitionAvailable(context)) {
             Log.e(TAG, "Speech recognition not available on this device")
             listener?.onError(SpeechRecognizer.ERROR_CLIENT)
             return
         }
+
+        cancelPendingRetry()
 
         if (recognizer == null) {
             recreateRecognizerLocked()
@@ -217,16 +245,20 @@ class LocalSttEngine(private val context: Context) {
             Log.e(TAG, "SpeechRecognizer startListening failed: ${e.message}")
             try { recognizer?.destroy() } catch (_: Exception) {}
             recognizer = null
-            listener?.onError(SpeechRecognizer.ERROR_CLIENT)
+            if (!isExplicitlyStopped) {
+                listener?.onError(SpeechRecognizer.ERROR_CLIENT)
+            }
         }
     }
 
     private val innerListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
+            if (destroyed || isExplicitlyStopped) return
             Log.d(TAG, "Ready for speech")
         }
 
         override fun onBeginningOfSpeech() {
+            if (destroyed || isExplicitlyStopped) return
             Log.d(TAG, "Speech began")
             mainHandler.removeCallbacks(watchdogRunnable)
             listener?.onSpeechBegin()
@@ -238,12 +270,19 @@ class LocalSttEngine(private val context: Context) {
         override fun onEndOfSpeech() {
             isListening = false
             mainHandler.removeCallbacks(watchdogRunnable)
+            if (destroyed || isExplicitlyStopped) return
             Log.d(TAG, "Speech ended – waiting for results")
         }
 
         override fun onError(error: Int) {
             isListening = false
             mainHandler.removeCallbacks(watchdogRunnable)
+
+            if (destroyed || isExplicitlyStopped) {
+                Log.d(TAG, "Ignoring STT error $error because recognizer is stopped or destroyed")
+                return
+            }
+
             Log.w(TAG, "STT error: $error")
 
             // Error 11 = ERROR_SERVER_DISCONNECTED, 8 = ERROR_RECOGNIZER_BUSY, 5 = ERROR_CLIENT
@@ -253,16 +292,21 @@ class LocalSttEngine(private val context: Context) {
                     val delayMs = 400L * internalRetryCount
                     val retryGeneration = startGeneration
                     Log.w(TAG, "Recoverable STT error ($error); rebuilding recognizer (retry $internalRetryCount/2 in ${delayMs}ms)")
-                    mainHandler.postDelayed({
-                        if (!isInitialized || destroyed || startGeneration != retryGeneration) return@postDelayed
+                    cancelPendingRetry()
+                    val retryRunnable = Runnable {
+                        if (!isInitialized || destroyed || isExplicitlyStopped || startGeneration != retryGeneration) return@Runnable
                         try {
                             recreateRecognizerLocked()
                             startListeningOnMain()
                         } catch (retryError: Exception) {
                             Log.w(TAG, "Recognizer retry failed: ${retryError.message}")
-                            listener?.onError(error)
+                            if (!isExplicitlyStopped) {
+                                listener?.onError(error)
+                            }
                         }
-                    }, delayMs)
+                    }
+                    pendingRetryRunnable = retryRunnable
+                    mainHandler.postDelayed(retryRunnable, delayMs)
                     return
                 }
             }
@@ -275,27 +319,38 @@ class LocalSttEngine(private val context: Context) {
                     val retryDelay = if (postTtsStart) 400L else 600L
                     val retryGeneration = startGeneration
                     Log.d(TAG, "Quick NO_MATCH after $startedAgo ms — measured retry #$internalRetryCount (delay=${retryDelay}ms)")
-                    mainHandler.postDelayed({
+                    cancelPendingRetry()
+                    val retryRunnable = Runnable {
                         try {
-                            if (!isInitialized || destroyed || startGeneration != retryGeneration) return@postDelayed
+                            if (!isInitialized || destroyed || isExplicitlyStopped || startGeneration != retryGeneration) return@Runnable
                             if (recognizer == null) recreateRecognizerLocked()
                             startListeningOnMain()
                         } catch (retryError: Exception) {
                             Log.w(TAG, "Measured retry failed: ${retryError.message}")
                         }
-                    }, retryDelay)
+                    }
+                    pendingRetryRunnable = retryRunnable
+                    mainHandler.postDelayed(retryRunnable, retryDelay)
                     return
                 }
             }
 
             internalRetryCount = 0
-            listener?.onError(error)
+            if (!isExplicitlyStopped) {
+                listener?.onError(error)
+            }
         }
 
         override fun onResults(results: Bundle?) {
             isListening = false
             internalRetryCount = 0
             mainHandler.removeCallbacks(watchdogRunnable)
+
+            if (destroyed || isExplicitlyStopped) {
+                Log.d(TAG, "Ignoring STT results because recognizer is stopped or destroyed")
+                return
+            }
+
             val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val scores = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
 
@@ -329,6 +384,7 @@ class LocalSttEngine(private val context: Context) {
         }
 
         override fun onPartialResults(partialResults: Bundle?) {
+            if (destroyed || isExplicitlyStopped) return
             val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
             val best = matches?.firstOrNull { it.isNotBlank() }?.trim() ?: return
             listener?.onPartialResult(best)

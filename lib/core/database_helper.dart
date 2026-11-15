@@ -32,6 +32,7 @@ class DatabaseHelper {
 
   static const List<Map<String, String>> defaultShortcuts = [
     {'trigger_phrase': 'torch', 'target_type': 'system', 'target_value': 'flashlightOn'},
+    {'trigger_phrase': 'flash', 'target_type': 'system', 'target_value': 'flashlightOn'},
     {'trigger_phrase': 'turn on flashlight', 'target_type': 'system', 'target_value': 'flashlightOn'},
     {'trigger_phrase': 'turn off flashlight', 'target_type': 'system', 'target_value': 'flashlightOff'},
     {'trigger_phrase': 'flashlight on', 'target_type': 'system', 'target_value': 'flashlightOn'},
@@ -50,6 +51,8 @@ class DatabaseHelper {
     {'trigger_phrase': 'screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
     {'trigger_phrase': 'take screenshot', 'target_type': 'system', 'target_value': 'screenshot'},
     {'trigger_phrase': 'lock screen', 'target_type': 'system', 'target_value': 'lockScreen'},
+    {'trigger_phrase': 'stop listening', 'target_type': 'system', 'target_value': 'sleep'},
+    {'trigger_phrase': 'go to sleep', 'target_type': 'system', 'target_value': 'sleep'},
     {'trigger_phrase': 'battery saver', 'target_type': 'system', 'target_value': 'batterySaver'},
     {'trigger_phrase': 'do not disturb', 'target_type': 'system', 'target_value': 'doNotDisturb'},
     {'trigger_phrase': 'show notifications', 'target_type': 'system', 'target_value': 'notifications'},
@@ -84,6 +87,20 @@ class DatabaseHelper {
     {'trigger_phrase': 'open clock', 'target_type': 'system', 'target_value': 'openApp:com.google.android.deskclock'},
     {'trigger_phrase': 'open gmail', 'target_type': 'system', 'target_value': 'openApp:com.google.android.gm'},
     {'trigger_phrase': 'open gallery', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.photos'},
+    {'trigger_phrase': 'open phone', 'target_type': 'system', 'target_value': 'openApp:com.google.android.dialer'},
+    {'trigger_phrase': 'open messages', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.messaging'},
+    {'trigger_phrase': 'open dialer', 'target_type': 'system', 'target_value': 'openApp:com.google.android.dialer'},
+    {'trigger_phrase': 'open files', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.files'},
+    {'trigger_phrase': 'open netflix', 'target_type': 'system', 'target_value': 'openApp:com.netflix.mediaclient'},
+    {'trigger_phrase': 'open uber', 'target_type': 'system', 'target_value': 'openApp:com.ubercab'},
+    {'trigger_phrase': 'open zomato', 'target_type': 'system', 'target_value': 'openApp:com.application.zomato'},
+    {'trigger_phrase': 'open swiggy', 'target_type': 'system', 'target_value': 'openApp:in.swiggy.android'},
+    {'trigger_phrase': 'open amazon', 'target_type': 'system', 'target_value': 'openApp:in.amazon.mShop.android.shopping'},
+    {'trigger_phrase': 'open flipkart', 'target_type': 'system', 'target_value': 'openApp:com.flipkart.android'},
+    {'trigger_phrase': 'open paytm', 'target_type': 'system', 'target_value': 'openApp:net.one97.paytm'},
+    {'trigger_phrase': 'open gpay', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.paisa.user'},
+    {'trigger_phrase': 'open google pay', 'target_type': 'system', 'target_value': 'openApp:com.google.android.apps.nbu.paisa.user'},
+    {'trigger_phrase': 'open phonepe', 'target_type': 'system', 'target_value': 'openApp:com.phonepe.app'},
   ];
 
   Future<Database> _initDatabase() async {
@@ -137,19 +154,21 @@ class DatabaseHelper {
   }
 
   Future<void> _ensureDefaultShortcuts(Database db) async {
+    final batch = db.batch();
     for (final shortcut in defaultShortcuts) {
-      await db.update(
+      batch.update(
         'custom_aliases',
         {'target_type': 'system'},
-        where: 'trigger_phrase = ? AND target_type != ?',
+        where: 'trigger_phrase = ? AND LOWER(target_type) != ?',
         whereArgs: [shortcut['trigger_phrase'], 'custom'],
       );
-      await db.insert(
+      batch.insert(
         'custom_aliases',
         shortcut,
         conflictAlgorithm: ConflictAlgorithm.ignore,
       );
     }
+    await batch.commit(noResult: true);
   }
 
   // ── Conversation APIs ────────────────────────────────────────────────────────
@@ -199,7 +218,7 @@ class DatabaseHelper {
     if (customFirst) {
       return await db.query(
         'custom_aliases',
-        orderBy: "CASE WHEN target_type = 'custom' THEN 0 ELSE 1 END, id DESC",
+        orderBy: "CASE WHEN LOWER(target_type) = 'custom' THEN 0 ELSE 1 END, id DESC",
       );
     }
     return await db.query('custom_aliases', orderBy: 'trigger_phrase ASC');
@@ -209,7 +228,7 @@ class DatabaseHelper {
     final db = await database;
     return await db.query(
       'custom_aliases',
-      where: "target_type = 'custom'",
+      where: "LOWER(target_type) = 'custom'",
       orderBy: 'id DESC',
     );
   }

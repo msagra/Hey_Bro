@@ -18,16 +18,22 @@ object LocalCommandProcessor {
 
     private const val TAG = "LocalCommandProcessor"
     private var geminiBridge: GeminiIntentBridge? = null
+    private var groqBridge: GroqIntentBridge? = null
     private var appContext: Context? = null
 
     fun initialize(context: Context) {
         appContext = context.applicationContext
         VoiceLearningStore.initialize(context)
         geminiBridge = GeminiIntentBridge(context)
+        groqBridge = GroqIntentBridge(context)
     }
 
     fun interpretWithGemini(transcript: String): Result? {
-        return geminiBridge?.interpret(transcript)
+        val geminiResult = geminiBridge?.interpret(transcript)
+        if (geminiResult != null) return geminiResult
+
+        Log.i(TAG, "Gemini REST unfulfilled; falling back to ultra-fast Groq intent bridge")
+        return groqBridge?.interpret(transcript)
     }
 
     data class Result(

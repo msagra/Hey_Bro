@@ -353,7 +353,8 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun checkPermissions(): Map<String, Boolean> {
-        val mic     = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        val mic = (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) ||
+            (androidx.core.content.PermissionChecker.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == androidx.core.content.PermissionChecker.PERMISSION_GRANTED)
         val camera  = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         val overlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) Settings.canDrawOverlays(this) else true
         val a11y    = isAccessibilityEnabled(this, DeviceOperatorService::class.java)

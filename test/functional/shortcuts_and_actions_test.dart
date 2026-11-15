@@ -38,7 +38,8 @@ void main() {
         'toggleAirplaneMode',
         'openMaps',
         'openSettings',
-        'openApp:'
+        'openApp:',
+        'sleep',
       ];
 
       for (final alias in aliases) {

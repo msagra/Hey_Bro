@@ -71,6 +71,15 @@ class CoreVoiceService : Service(),
     @Volatile private var serviceState = ServiceState.IDLE
     private var sttFailureCount = 0
     private var sttRetryInFlight = false
+    private var sttRetryRunnable: Runnable? = null
+
+    private fun cancelSttRetry() {
+        sttRetryInFlight = false
+        sttRetryRunnable?.let {
+            mainHandler.removeCallbacks(it)
+            sttRetryRunnable = null
+        }
+    }
 
     // Audio focus helpers
     private var audioFocusRequested = false
@@ -476,12 +485,14 @@ class CoreVoiceService : Service(),
         serviceDestroyed = true
         mainHandler.removeCallbacks(startWakeWordRunnable)
         cancelStateWatchdog()
+        cancelSttRetry()
         stopCaptureAudio()
         cancelBackendFallback()
         backendResponseHandler.removeCallbacksAndMessages(null)
         try { audioStreamer?.stopAll() } catch (_: Exception) {}
         audioStreamer = null
         try { audioJob?.cancel() } catch (_: Exception) {}
+        audioJob = null
         releaseWakeRecorder()
         try { wakeWordManager?.release() } catch (_: Exception) {}
         try { sileroVad?.close() } catch (_: Exception) {}
@@ -638,13 +649,12 @@ class CoreVoiceService : Service(),
             val idx = (sttFailureCount - 1).coerceAtLeast(0).coerceAtMost(retryDelays.size - 1)
             val delayMs = retryDelays.getOrNull(idx) ?: 3000L
             Log.d(TAG, "Transient STT error; scheduling retry #$sttFailureCount (delay=${delayMs}ms)")
-            mainHandler.postDelayed({
+            cancelSttRetry()
+            val runnable = Runnable {
                 try {
-                    if (serviceState != ServiceState.LISTENING) {
-                        transitionTo(ServiceState.LISTENING)
-                        overlayManager.show(OverlayManager.State.LISTENING)
-                        pushEvent(mapOf("state" to "LISTENING"))
-                        updateNotification("I'm listening…")
+                    if (serviceDestroyed || serviceState != ServiceState.LISTENING) {
+                        Log.d(TAG, "STT retry aborted because service is $serviceState")
+                        return@Runnable
                     }
 
                     sttRetryInFlight = true
@@ -658,12 +668,14 @@ class CoreVoiceService : Service(),
                 } catch (e: Exception) {
                     Log.w(TAG, "Retry startListening failed outer: ${e.message}")
                 }
-            }, delayMs)
+            }
+            sttRetryRunnable = runnable
+            mainHandler.postDelayed(runnable, delayMs)
             return
         }
 
         mainHandler.post {
-            sttRetryInFlight = false
+            cancelSttRetry()
             abandonAudioFocus()
 
             if (msg != null) {
@@ -929,11 +941,11 @@ class CoreVoiceService : Service(),
         }
 
         if (serviceState != ServiceState.IDLE) return
-        if (nowMs - lastWakeAtMs < 1200L) {
+        if (nowMs - lastWakeAtMs < 750L) {
             Log.d(TAG, "Wake cooldown active; ignoring extra trigger")
             return
         }
-        if (nowMs - lastFailedListenAtMs < 1200L) {
+        if (nowMs - lastFailedListenAtMs < 500L) {
             Log.d(TAG, "Recent STT failure cooldown active; not re-triggering wake detection")
             return
         }
@@ -1051,16 +1063,21 @@ class CoreVoiceService : Service(),
 
     private fun resetToIdle() {
         cancelStateWatchdog()
+        cancelSttRetry()
         transitionTo(ServiceState.IDLE)
         sileroVad?.resetStates()
         stopCaptureAudio()
         sttEngine.stopListening()
+        try {
+            audioJob?.cancel()
+            audioJob = null
+        } catch (_: Exception) {}
         releaseWakeRecorder()
 
         (wakeWordManager?.activeEngine as? HeyBroPhraseWakeEngine)?.resetState()
 
         mainHandler.removeCallbacks(startWakeWordRunnable)
-        mainHandler.postDelayed(startWakeWordRunnable, 250L)
+        mainHandler.postDelayed(startWakeWordRunnable, 200L)
 
         updateNotification("Say \"Hey Bro\" to activate")
     }
