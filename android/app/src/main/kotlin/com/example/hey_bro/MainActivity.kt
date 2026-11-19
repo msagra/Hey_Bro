@@ -302,6 +302,7 @@ class MainActivity : FlutterActivity() {
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     CoreVoiceService.eventSink = events
+                    CoreVoiceService.syncStateToFlutter()
                 }
                 override fun onCancel(arguments: Any?) {
                     CoreVoiceService.eventSink = null

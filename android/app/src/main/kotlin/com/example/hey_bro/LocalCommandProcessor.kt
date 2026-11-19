@@ -44,39 +44,89 @@ object LocalCommandProcessor {
     // ─────────────────────────────────────────────────────────────────────────
     //  Parallel Local Fast-Path (<50ms deterministic execution)
     // ─────────────────────────────────────────────────────────────────────────
-    fun checkFastPath(chunkTranscript: String): Result? {
+    fun checkFastPath(chunkTranscript: String, partial: Boolean = false): Result? {
         val t = normalizeCommand(chunkTranscript)
         if (t.isBlank()) return null
 
         // 1. Check VoiceLearningStore / custom shortcuts
-        val learnedAction = VoiceLearningStore.findActionForTranscript(t)
+        val learnedAction = if (partial) {
+            VoiceLearningStore.findExactActionForTranscript(t)
+        } else {
+            VoiceLearningStore.findActionForTranscript(t)
+        }
         if (learnedAction != null) {
-            Log.i(TAG, "Parallel fast-path matched custom shortcut: '$t' -> $learnedAction (<50ms)")
-            return actionResultFromName(learnedAction)
+            Log.i(TAG, "Parallel fast-path matched a custom shortcut")
+            return validatedFastPath(t, actionResultFromName(learnedAction), partial, exactShortcut = true)
         }
 
-        // 2. Check deterministic regex rules (flashlight, volume, alarm, timer, call)
+        // 2. Check deterministic rules before waiting for a model tool call.
         val single = processSingle(t, chunkTranscript)
-        if (single.action != null) {
-            val act = single.action.optString("action")
-            if (act in setOf(
+        if (partial && !isCompletePartialFastPathCommand(t, single.action?.optString("action").orEmpty())) {
+            return null
+        }
+        return validatedFastPath(t, single, partial)
+    }
+
+    private fun validatedFastPath(
+        transcript: String,
+        result: Result,
+        partial: Boolean,
+        exactShortcut: Boolean = false
+    ): Result? {
+        val action = result.action ?: return null
+        val actionName = action.optString("action")
+        if (actionName !in setOf(
                 "flashlightOn", "flashlightOff",
                 "volumeUp", "volumeDown", "mute",
-                "setAlarm", "setTimer", "makeCall",
+                "toggleWifi", "toggleBluetooth", "adjustBrightness",
+                "setAlarm", "setTimer", "makeCall", "openApp",
                 "openCamera", "takePhoto", "takeSelfie",
-                "screenshot", "globalBack", "globalHome"
-            )) {
-                Log.i(TAG, "Parallel fast-path matched deterministic hardware rule: $act (<50ms)")
-                return single
-            }
+                "screenshot", "globalBack", "globalHome", "lockScreen"
+            ) ||
+            !ActionPayloadValidator.isValidActionPayload(actionName, action) ||
+            (!exactShortcut && !hasCompleteFastPathDetails(transcript, actionName, action))
+        ) return null
+        if (partial && !exactShortcut && !isCompletePartialFastPathCommand(transcript, actionName)) return null
+        return result
+    }
+
+    private fun hasCompleteFastPathDetails(transcript: String, actionName: String, action: JSONObject): Boolean {
+        return when (actionName) {
+            "setTimer" -> Regex("\\b\\d+\\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\\b")
+                .containsMatchIn(transcript)
+            "setAlarm" -> Regex("\\b(?:at|for)\\s*\\d{1,2}\\b|\\b\\d{1,2}(?::\\d{2})?\\s*(?:am|pm)\\b")
+                .containsMatchIn(transcript)
+            "makeCall" -> action.optString("number").isNotBlank()
+            "openApp" -> action.optString("appName").isNotBlank() ||
+                action.optString("packageName").isNotBlank()
+            else -> true
         }
-        return null
+    }
+
+    private fun isCompletePartialFastPathCommand(transcript: String, actionName: String): Boolean {
+        val phrases = when (actionName) {
+            "flashlightOn" -> setOf("turn on flashlight", "flashlight on", "turn on torch", "torch on", "turn on flash", "flash on")
+            "flashlightOff" -> setOf("turn off flashlight", "flashlight off", "turn off torch", "torch off", "turn off flash", "flash off")
+            "volumeUp" -> setOf("volume up", "increase volume", "raise volume", "louder")
+            "volumeDown" -> setOf("volume down", "decrease volume", "lower volume", "quieter")
+            "mute" -> setOf("mute", "mute volume", "silence phone")
+            "toggleWifi" -> setOf("wifi on", "turn on wifi", "wifi off", "turn off wifi")
+            "toggleBluetooth" -> setOf("bluetooth on", "turn on bluetooth", "bluetooth off", "turn off bluetooth")
+            "adjustBrightness" -> setOf("brightness up", "increase brightness", "brightness down", "decrease brightness")
+            "screenshot" -> setOf("screenshot", "take screenshot", "take a screenshot")
+            "openCamera" -> setOf("open camera", "launch camera", "camera on")
+            "globalBack" -> setOf("go back", "press back", "navigate back")
+            "globalHome" -> setOf("go home", "press home", "home screen")
+            "lockScreen" -> setOf("lock screen", "lock phone", "lock device")
+            else -> emptySet()
+        }
+        return transcript in phrases
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     fun process(transcript: String): Result {
         val t = normalizeCommand(transcript)
-        Log.d(TAG, "Processing normalized: \"$t\" (raw: \"$transcript\")")
+        Log.d(TAG, "Processing transcript (${transcript.length} characters)")
 
         // 1. Check VoiceLearningStore
         val learnedAction = VoiceLearningStore.findActionForTranscript(t)
@@ -138,6 +188,10 @@ object LocalCommandProcessor {
     }
 
     private fun processSingle(t: String, rawTranscript: String): Result {
+        if (t.startsWith("don t ") || t.startsWith("do not ") || t.startsWith("never ")) {
+            return Result(null, "Okay, I won't do that.")
+        }
+
         return when {
 
             // ── Basic lock-screen-safe commands ──────────────────────────────
@@ -234,9 +288,9 @@ object LocalCommandProcessor {
             t.containsAny(
                 "turn on flashlight", "flashlight on", "turn on torch", "torch on",
                 "turn on flash", "turn flash on", "turn on the flashlight", "flash on", "light on",
-                "turn on light", "torch", "flashlight", "open flashlight", "open torch",
+                "turn on light", "open flashlight", "open torch",
                 "enable flashlight", "enable torch", "switch on flashlight", "switch on torch"
-            ) ->
+            ) || t in setOf("torch", "flashlight", "flash") ->
                 Result(action("flashlightOn"), "Turning on flashlight")
 
             t.containsAny(
@@ -248,28 +302,28 @@ object LocalCommandProcessor {
                 Result(action("flashlightOff"), "Turning off flashlight")
 
             t.containsAny("hotspot on", "turn on hotspot", "enable hotspot", "start hotspot", "switch on hotspot") ->
-                Result(action("toggleHotspot", "enabled" to "true"), "Turning on hotspot")
+                Result(action("toggleHotspot", "enabled" to true), "Turning on hotspot")
 
             t.containsAny("hotspot off", "turn off hotspot", "disable hotspot", "stop hotspot", "switch off hotspot") ->
-                Result(action("toggleHotspot", "enabled" to "false"), "Turning off hotspot")
+                Result(action("toggleHotspot", "enabled" to false), "Turning off hotspot")
 
             t.containsAny("wifi on", "turn on wifi", "enable wifi", "start wifi", "switch on wifi") ->
-                Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
+                Result(action("toggleWifi", "enabled" to true), "Turning on Wi-Fi")
 
             t.containsAny("wifi off", "turn off wifi", "disable wifi", "stop wifi", "switch off wifi") ->
-                Result(action("toggleWifi", "enabled" to "false"), "Turning off Wi-Fi")
+                Result(action("toggleWifi", "enabled" to false), "Turning off Wi-Fi")
 
             t.containsAny("bluetooth on", "turn on bluetooth", "enable bluetooth", "start bluetooth", "switch on bluetooth") ->
-                Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
+                Result(action("toggleBluetooth", "enabled" to true), "Turning on Bluetooth")
 
             t.containsAny("bluetooth off", "turn off bluetooth", "disable bluetooth", "stop bluetooth", "switch off bluetooth") ->
-                Result(action("toggleBluetooth", "enabled" to "false"), "Turning off Bluetooth")
+                Result(action("toggleBluetooth", "enabled" to false), "Turning off Bluetooth")
 
             t.containsAny("airplane mode on", "turn on airplane", "enable airplane") ->
-                Result(action("toggleAirplaneMode", "enabled" to "true"), "Turning on Airplane mode")
+                Result(action("toggleAirplaneMode", "enabled" to true), "Turning on Airplane mode")
 
             t.containsAny("airplane mode off", "turn off airplane", "disable airplane") ->
-                Result(action("toggleAirplaneMode", "enabled" to "false"), "Turning off Airplane mode")
+                Result(action("toggleAirplaneMode", "enabled" to false), "Turning off Airplane mode")
 
             t.containsAny("battery saver on", "turn on battery saver", "enable battery saver") ->
                 Result(action("batterySaver"), "Opening Battery Saver settings")
@@ -452,8 +506,8 @@ object LocalCommandProcessor {
                 Result(action("sleep"), "Going to sleep. Say Hey Bro to wake me up.")
 
             else -> {
-                Log.d(TAG, "No local rule matched for: \"$t\"")
-                Result(null, "Sorry, I didn't understand \"$rawTranscript\". Try asking for flashlight, alarms, calls, notifications, or general questions.")
+                Log.d(TAG, "No local rule matched")
+                Result(null, "Sorry, I didn't understand. Try asking for flashlight, alarms, calls, notifications, or general questions.")
             }
         }
     }
@@ -737,10 +791,10 @@ object LocalCommandProcessor {
             "mediaPlayPause"     -> Result(action("mediaPlayPause"), "Toggling playback")
             "mediaNext"          -> Result(action("mediaNext"), "Skipping track")
             "mediaPrevious"      -> Result(action("mediaPrevious"), "Previous track")
-            "toggleWifi"         -> Result(action("toggleWifi", "enabled" to "true"), "Turning on Wi-Fi")
-            "toggleBluetooth"    -> Result(action("toggleBluetooth", "enabled" to "true"), "Turning on Bluetooth")
-            "toggleAirplaneMode" -> Result(action("toggleAirplaneMode", "enabled" to "true"), "Toggling Airplane mode")
-            "toggleHotspot"      -> Result(action("toggleHotspot", "enabled" to "true"), "Toggling hotspot")
+            "toggleWifi"         -> Result(action("toggleWifi", "enabled" to true), "Turning on Wi-Fi")
+            "toggleBluetooth"    -> Result(action("toggleBluetooth", "enabled" to true), "Turning on Bluetooth")
+            "toggleAirplaneMode" -> Result(action("toggleAirplaneMode", "enabled" to true), "Toggling Airplane mode")
+            "toggleHotspot"      -> Result(action("toggleHotspot", "enabled" to true), "Toggling hotspot")
             "openSettings"       -> Result(action("openSettings"), "Opening Settings")
             "openMaps"           -> Result(action("openMaps"), "Opening Maps")
             "setAlarm"           -> Result(action("setAlarm", "hour" to 7, "minute" to 0, "message" to "Wake up"), "Alarm set for 7:00")

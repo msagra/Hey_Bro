@@ -64,6 +64,10 @@ android {
             signingConfig = signingConfigs.getByName("debug")
         }
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 kotlin {
@@ -85,4 +89,5 @@ dependencies {
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
     // JSON parsing
     implementation("org.json:json:20231013")
+    testImplementation("junit:junit:4.13.2")
 }

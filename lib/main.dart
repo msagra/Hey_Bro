@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:hey_bro/core/database_helper.dart';
+import 'package:hey_bro/core/native_event_order.dart';
 import 'package:hey_bro/ui/siri_orb_overlay.dart';
 
 void main() async {
@@ -118,6 +119,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   // ── Service State ──────────────────────────────────────────────────────────
   bool _serviceRunning = false;
   AssistantState _assistantState = AssistantState.idle;
+  final NativeEventOrder _nativeEventOrder = NativeEventOrder();
   String _activeEngine = 'HeyBroPhraseWakeEngine';
   bool _autostart = false;
 
@@ -144,6 +146,7 @@ class _DashboardScreenState extends State<DashboardScreen>
   final List<_Exchange> _history = [];
   List<Map<String, dynamic>> _customShortcuts = [];
   String? _pendingTranscript;
+  String _streamingResponseText = '';
 
   // ── Animations ────────────────────────────────────────────────────────────
   late final AnimationController _pulseCtrl;
@@ -279,6 +282,13 @@ class _DashboardScreenState extends State<DashboardScreen>
 
     try {
       final data = json.decode(raw as String) as Map<String, dynamic>;
+      if (!_nativeEventOrder.accepts(
+        sessionId: data['sessionId'],
+        sequenceId: data['sequenceId'],
+        stateSync: data['stateSync'] == true || data['stateSync'] == 'true',
+      )) {
+        return;
+      }
       if (data['type'] == 'permissions_updated') {
         _checkPermissions();
         return;
@@ -287,6 +297,10 @@ class _DashboardScreenState extends State<DashboardScreen>
       final stateStr = data['state'] as String? ?? '';
       final transcript = data['transcript'] as String?;
       final response = data['response'] as String? ?? '';
+      final responseStreaming = data['responseStreaming'] == true ||
+          data['responseStreaming'] == 'true';
+      final responseComplete = data['responseComplete'] == true ||
+          data['responseComplete'] == 'true';
       final engine = data['activeEngine'] as String?;
 
       AssistantState newState = _assistantState;
@@ -300,6 +314,7 @@ class _DashboardScreenState extends State<DashboardScreen>
           newState = AssistantState.processing;
           break;
         case 'PLAYING':
+        case 'SPEAKING':
           newState = AssistantState.playing;
           break;
         case 'IDLE':
@@ -318,6 +333,9 @@ class _DashboardScreenState extends State<DashboardScreen>
       final hasStateChanged = newState != _assistantState;
       final hasWsChanged = newWsConnected != _wsConnected;
       final hasEngineChanged = engine != null && engine != _activeEngine;
+      final hasResponseChanged = (responseStreaming &&
+              response != _streamingResponseText) ||
+          responseComplete;
 
       bool hasTranscriptChanged = false;
       if (newState == AssistantState.listening ||
@@ -330,7 +348,8 @@ class _DashboardScreenState extends State<DashboardScreen>
       if (hasStateChanged ||
           hasWsChanged ||
           hasEngineChanged ||
-          hasTranscriptChanged) {
+          hasTranscriptChanged ||
+          hasResponseChanged) {
         if (newState == AssistantState.listening) {
           _siriDismissTimer?.cancel();
           _siriDismissTimer = null;
@@ -355,11 +374,45 @@ class _DashboardScreenState extends State<DashboardScreen>
           if (newState == AssistantState.listening ||
               newState == AssistantState.idle) {
             _pendingTranscript = null;
+            if (newState == AssistantState.listening) {
+              _streamingResponseText = '';
+            }
           } else if (transcript != null) {
             _pendingTranscript = transcript;
           }
 
-          if (stateStr == 'PLAYING') {
+          if (responseStreaming) {
+            _streamingResponseText = response;
+          }
+
+          if (responseComplete) {
+            final finalTranscript = transcript ?? _pendingTranscript ?? '';
+            final finalResponse =
+                response.isNotEmpty ? response : _streamingResponseText;
+            if (finalTranscript.isNotEmpty || finalResponse.isNotEmpty) {
+              _history.insert(
+                0,
+                _Exchange(user: finalTranscript, assistant: finalResponse),
+              );
+              if (finalTranscript.isNotEmpty) {
+                DatabaseHelper.instance.insertConversation(
+                  'user',
+                  finalTranscript,
+                );
+              }
+              if (finalResponse.isNotEmpty) {
+                DatabaseHelper.instance.insertConversation(
+                  'assistant',
+                  finalResponse,
+                );
+              }
+            }
+            _streamingResponseText = '';
+            _pendingTranscript = null;
+          } else if (stateStr == 'PLAYING' &&
+              !responseStreaming &&
+              response.isNotEmpty &&
+              response != 'Speaking…') {
             final finalTranscript = transcript ?? _pendingTranscript ?? '';
             if (response.isNotEmpty || finalTranscript.isNotEmpty) {
               _history.insert(
@@ -1691,9 +1744,9 @@ class _DashboardScreenState extends State<DashboardScreen>
               child: SiriOrbOverlay(
                 state: _mapSiriState(_assistantState),
                 transcript: _pendingTranscript ?? '',
-                responseText: _history.isNotEmpty
-                    ? _history.first.assistant
-                    : '',
+                responseText: _streamingResponseText.isNotEmpty
+                    ? _streamingResponseText
+                    : (_history.isNotEmpty ? _history.first.assistant : ''),
                 screenContext: _screenContext,
                 onMicTap: () async {
                   try {

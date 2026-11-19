@@ -172,7 +172,10 @@ class SileroVad(context: Context) {
         threshold: Float = 0.35f,
         sampleRate: Int = 16000
     ): Boolean {
-        val prob = isSpeech(audioData, sampleRate)
+        return smoothProbability(isSpeech(audioData, sampleRate), threshold)
+    }
+
+    fun smoothProbability(prob: Float, threshold: Float = 0.35f): Boolean {
         if (prob >= threshold) {
             hangoverRemaining = defaultHangoverFrames
             return true

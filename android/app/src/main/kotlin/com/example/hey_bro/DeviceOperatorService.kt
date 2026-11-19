@@ -6,6 +6,7 @@ import android.app.AlarmManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
+import android.graphics.Rect
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CameraCharacteristics
 import android.media.AudioManager
@@ -103,33 +104,86 @@ class DeviceOperatorService : AccessibilityService() {
         return sb.toString().trim().take(1500)
     }
 
+    fun serializeActiveUiHierarchy(maxNodes: Int = 24): String {
+        val root = rootInActiveWindow ?: return ""
+        val nodes = org.json.JSONArray()
+        val packageName = root.packageName?.toString().orEmpty().take(120)
+        var visited = 0
+
+        fun traverse(node: AccessibilityNodeInfo?) {
+            if (node == null || visited >= maxNodes) return
+            visited++
+            if (node.isClickable || node.isEditable) {
+                val label = if (node.isEditable) {
+                    if (node.isPassword) null else node.hintText?.toString()
+                } else {
+                    node.text?.toString()?.takeIf { it.isNotBlank() }
+                        ?: node.contentDescription?.toString()
+                }
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                nodes.put(JSONObject().apply {
+                    put("label", label.orEmpty().trim().take(80))
+                    put("viewId", node.viewIdResourceName.orEmpty().take(120))
+                    put("clickable", node.isClickable)
+                    put("editable", node.isEditable)
+                    put("bounds", "${bounds.left},${bounds.top},${bounds.right},${bounds.bottom}")
+                })
+            }
+            for (i in 0 until node.childCount) {
+                traverse(node.getChild(i))
+            }
+        }
+        try {
+            traverse(root)
+        } catch (e: Exception) {
+            Log.w(TAG, "Error serializing active UI hierarchy: ${e.message}")
+        }
+        return JSONObject().apply {
+            put("packageName", packageName)
+            put("nodes", nodes)
+        }.toString().take(4000)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     //  Main dispatch
     // ─────────────────────────────────────────────────────────────────────────
 
     fun executeCommand(payload: String) {
-        try {
+        executeCommand(payload, voiceConfirmed = false)
+    }
+
+    internal fun executeCommand(payload: String, voiceConfirmed: Boolean): Boolean {
+        return try {
             val json   = JSONObject(payload)
             
-            // Handle compound MULTI_ACTION intents
-            if (json.optString("type") == "MULTI_ACTION") {
-                val actions = json.optJSONArray("actions") ?: return
-                var delay = 0L
-                for (i in 0 until actions.length()) {
-                    val actionObj = actions.optJSONObject(i) ?: continue
-                    val subPayload = JSONObject().apply {
-                        put("type", "ACTION")
-                        put("action", actionObj.optString("action"))
-                        if (actionObj.has("params")) {
-                            put("params", actionObj.optJSONObject("params"))
-                        }
-                    }
-                    mainHandler.postDelayed({
-                        executeCommand(subPayload.toString())
-                    }, delay)
-                    delay += 150L
+            // Handle compound MULTI_ACTION intents while retaining the legacy action-only wrapper.
+            if (json.optString("type") == "MULTI_ACTION" || json.optString("action") == "MULTI_ACTION") {
+                val actions = json.optJSONArray("actions")
+                if (!ActionPayloadValidator.isValidMultiAction(
+                        json,
+                        ExtendedOperations.EXTENDED_SETTINGS_ACTIONS.keys
+                    )
+                ) {
+                    Log.w(TAG, "Rejecting malformed MULTI_ACTION envelope or step")
+                    return false
                 }
-                return
+
+                if (ActionPayloadValidator.requiresVoiceConfirmation(json) && !voiceConfirmed) {
+                    Log.w(TAG, "Rejecting sensitive MULTI_ACTION without voice confirmation")
+                    return false
+                }
+                executeMultiAction(actions!!, voiceConfirmed)
+                return true
+            }
+
+            if (!ActionPayloadValidator.isValidActionEnvelope(
+                    json,
+                    ExtendedOperations.EXTENDED_SETTINGS_ACTIONS.keys
+                )
+            ) {
+                Log.w(TAG, "Rejecting malformed ACTION envelope or parameters")
+                return false
             }
             
             // Standardized backend schema nests args under "params" and carries
@@ -144,11 +198,15 @@ class DeviceOperatorService : AccessibilityService() {
                 }
             }
             val action = json.optString("action")
-            Log.d(TAG, "executeCommand → $action  |  $payload")
+            Log.d(TAG, "executeCommand → $action")
 
             if (action.isBlank()) {
                 Log.w(TAG, "Ignoring device operation without an action: $payload")
-                return
+                return false
+            }
+            if (ActionPayloadValidator.requiresVoiceConfirmation(json) && !voiceConfirmed) {
+                Log.w(TAG, "Rejecting sensitive action without voice confirmation: $action")
+                return false
             }
 
             if (isDeviceLocked() && !isLockscreenSafeAction(action)) {
@@ -160,12 +218,13 @@ class DeviceOperatorService : AccessibilityService() {
                             km?.requestDismissKeyguard(activity, null)
                         }
                     }
+
                 } catch (e: Exception) {
                     Log.w(TAG, "Failed to request keyguard dismissal: ${e.message}")
                 }
             }
 
-            if (executeExtendedOperation(action, json)) return
+            if (executeExtendedOperation(action, json)) return true
 
             when (action) {
                 "click"                 -> clickNode(json.optString("targetText", ""), json.optString("targetId", ""))
@@ -178,7 +237,7 @@ class DeviceOperatorService : AccessibilityService() {
                 "recents"               -> performGlobalAction(GLOBAL_ACTION_RECENTS)
                 "globalAction"          -> handleGlobalAction(json.optString("target", "home"))
                 "controlHardware"       -> controlHardware(json)
-                "openApp"               -> openApp(json.optString("appName"))
+                "openApp"               -> openApp(json.optString("appName").ifBlank { json.optString("packageName") })
                 "openCamera"            -> openCamera(front = false)
                 "takePhoto"             -> takePhoto(front = false, delaySeconds = json.optInt("delaySeconds", 0))
                 "takeSelfie"            -> takePhoto(front = true, delaySeconds = json.optInt("delaySeconds", 0))
@@ -238,9 +297,81 @@ class DeviceOperatorService : AccessibilityService() {
                 "sleep"                 -> { /* handled by CoreVoiceService */ }
                 else                    -> Log.w(TAG, "Unknown action: $action")
             }
+            true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to execute command: $payload", e)
+            Log.e(TAG, "Failed to execute device command", e)
+            false
         }
+    }
+
+    private fun executeMultiAction(actions: org.json.JSONArray, voiceConfirmed: Boolean) {
+        fun runStep(index: Int) {
+            if (index >= actions.length()) return
+            val step = actions.optJSONObject(index)
+            val action = step?.optString("action").orEmpty()
+            val params = step?.optJSONObject("params")
+            if (step == null || action.isBlank() || (step.has("params") && params == null)) {
+                CoreVoiceService.reportActionProgress(index, "failed", "Invalid step schema")
+                return
+            }
+
+            val precondition = step.optJSONObject("precondition")
+            val targetPackage = precondition?.optString("packageName").orEmpty().trim()
+            val timeoutMs = (precondition?.optLong("timeoutMs", 2500L) ?: 2500L).coerceIn(0L, 5000L)
+            val startedAt = android.os.SystemClock.elapsedRealtime()
+
+            fun dispatchWhenReady() {
+                if (targetPackage.isNotBlank()) {
+                    val activePackage = rootInActiveWindow?.packageName?.toString().orEmpty()
+                    if (activePackage != targetPackage) {
+                        if (android.os.SystemClock.elapsedRealtime() - startedAt >= timeoutMs) {
+                            CoreVoiceService.reportActionProgress(index, "failed", "Timed out waiting for $targetPackage")
+                            return
+                        }
+                        CoreVoiceService.reportActionProgress(index, "waiting", "Waiting for target app")
+                        mainHandler.postDelayed({ dispatchWhenReady() }, 100L)
+                        return
+                    }
+                }
+
+                val subPayload = JSONObject().apply {
+                    put("type", "ACTION")
+                    put("action", action)
+                    if (params != null) put("params", params)
+                    if (voiceConfirmed) put("voiceConfirmed", true)
+                    if (step.has("precondition")) put("precondition", precondition)
+                }
+                if (!isValidActionPayload(action, mergeParams(subPayload))) {
+                    CoreVoiceService.reportActionProgress(index, "failed", "Invalid parameters for $action")
+                    return
+                }
+
+                CoreVoiceService.reportActionProgress(index, "started", "")
+                if (!executeCommand(subPayload.toString(), voiceConfirmed)) {
+                    CoreVoiceService.reportActionProgress(index, "failed", "Dispatch failed for $action")
+                    return
+                }
+                CoreVoiceService.reportActionProgress(index, "dispatched", "")
+                val settleMs = step.optLong("settleMs", 150L).coerceIn(0L, 2000L)
+                mainHandler.postDelayed({ runStep(index + 1) }, settleMs)
+            }
+
+            dispatchWhenReady()
+        }
+
+        runStep(0)
+    }
+
+    private fun mergeParams(json: JSONObject): JSONObject {
+        return ActionPayloadValidator.mergeParams(json)
+    }
+
+    private fun isValidActionPayload(action: String, json: JSONObject): Boolean {
+        return ActionPayloadValidator.isValidActionPayload(
+            action,
+            json,
+            ExtendedOperations.EXTENDED_SETTINGS_ACTIONS.keys
+        )
     }
 
     /** Executes the extended operation catalog through Android's public settings intents. */

@@ -1,6 +1,6 @@
 # Hey Bro
 
-Hey Bro is an Android-first voice assistant project that connects a Flutter control app, native Android services, and a Python/FastAPI backend into one real-time voice automation stack.
+Hey Bro is an Android-first voice assistant with a Flutter dashboard and an Android-native, edge-first voice pipeline. Live voice connects directly from Android to Gemini over WebSockets; no Python middleware backend is included in this repository.
 
 The project is designed to handle the full lifecycle of an assistant experience:
 
@@ -8,9 +8,9 @@ The project is designed to handle the full lifecycle of an assistant experience:
 - microphone capture and local fallback processing
 - transcription and decision-making through LLMs or local rules
 - device automation through Android Accessibility APIs, notifications, hardware controls, and app launches
-- spoken responses through Android TTS or streamed backend TTS
+- streamed Gemini audio responses and on-device TTS fallback
 
-This repository is not just a UI demo — it is a complete end-to-end voice-assistant architecture with native Android execution and a server-side decision pipeline.
+This repository includes the Flutter UI, Android audio and automation services, and direct Gemini Live integration.
 
 ---
 
@@ -21,14 +21,14 @@ At a high level, the system works like this:
 1. The user says a wake phrase such as "Hey Bro".
 2. Android wake detection picks it up and starts listening.
 3. Audio is captured and sent to the assistant pipeline.
-4. The backend transcribes the audio and decides whether the request is:
+4. Gemini Live transcribes the audio and decides whether the request is:
    - a conversational question
    - a system command
    - an action to execute on the phone
-5. If the request requires a device action, Android executes it through `DeviceOperatorService`.
+5. Deterministic local commands execute through `LocalCommandProcessor`; other actions execute through `DeviceOperatorService`.
 6. The assistant sends a spoken response back to the user.
 
-This makes Hey Bro a hybrid system: local responsiveness for wake detection and device control, plus cloud or API-based intelligence for advanced reasoning.
+This makes Hey Bro a hybrid system: local wake detection and deterministic device control, plus direct cloud intelligence for advanced reasoning.
 
 ---
 
@@ -76,13 +76,6 @@ hey_bro/
 │   │       │   └── NativeSpeechEngine.kt
 │   │       └── res/xml/accessibility_service_config.xml
 │   └── build.gradle.kts
-├── backend/
-│   ├── main.py
-│   ├── run.py
-│   ├── requirements.txt
-│   ├── .env
-│   ├── .env.example
-│   └── instructions.md
 ├── ios/
 ├── linux/
 ├── macos/
@@ -106,7 +99,7 @@ Responsibilities:
 - permission checks and request flows
 - native Android service controls
 - event handling from the Android layer
-- backend connection settings and live state updates
+- Gemini connection settings and live state updates
 
 ### 2. Android native layer
 The app logic is implemented in Kotlin under `android/app/src/main/kotlin/com/example/hey_bro/`.
@@ -119,15 +112,8 @@ Responsibilities:
 - notifications and phone/system access
 - overlay UI and foreground service lifecycle
 
-### 3. Backend layer
-The backend is a Python FastAPI service under `backend/`.
-
-Responsibilities:
-- receiving raw audio chunks over WebSocket
-- STT transcription via multiple providers
-- intent classification and tool selection
-- action payload creation
-- TTS streaming back to Android
+### 3. Direct cloud connection
+`AudioStreamer.kt` connects directly to Gemini Live. There is no `backend/` directory or server process in this checkout; offline command handling and STT/TTS fallbacks remain on-device.
 
 ---
 
@@ -138,10 +124,8 @@ flowchart TD
     User[User speaks] --> Wake[HeyBroPhraseWakeEngine]
     Wake --> Service[CoreVoiceService]
     Service --> Audio[Audio capture + VAD]
-    Audio --> Backend[FastAPI WebSocket backend]
-    Backend --> STT[Transcription pipeline]
-    STT --> LLM[LLM decision layer]
-    LLM --> Action{Action or conversation?}
+    Audio --> Gemini[Gemini Live WebSocket]
+    Gemini --> Action{Tool action or conversation?}
     Action -->|Action| Device[DeviceOperatorService]
     Action -->|Conversation| Reply[Spoken response]
     Device --> OS[Android OS / apps / hardware]
@@ -154,9 +138,9 @@ flowchart TD
 2. The wake engine is listening in the background for the trigger phrase.
 3. Once the wake phrase is detected, the assistant begins the active listening cycle.
 4. `CoreVoiceService` captures audio and attempts local or remote processing.
-5. The captured audio is sent to the backend over WebSocket.
-6. The backend uses a transcription chain (`Vosk`, local Whisper, or Groq Whisper) to convert speech to text.
-7. A decision engine chooses the next action:
+5. Audio is streamed directly from Android to Gemini Live; Silero VAD retains onset audio and detects turn boundaries.
+6. Local deterministic commands run alongside live transcription; Gemini tool calls handle other requests.
+7. The assistant chooses the next action:
    - open app
    - send WhatsApp message
    - make call
@@ -190,7 +174,7 @@ The main Flutter file is the dashboard/control center for the assistant.
 - `_toggleService()`
   - starts or stops the assistant service
 - `_loadBackendConfig()`
-  - reads configured backend WebSocket URL
+  - reads configured Gemini WebSocket URL
 - `MethodChannel('com.example.hey_bro/assistant')`
   - bridge between Flutter and native Android
 - `EventChannel('com.example.hey_bro/events')`
@@ -201,9 +185,9 @@ The main Flutter file is the dashboard/control center for the assistant.
 The dashboard displays:
 - service runtime state
 - active engine name
-- backend connection status
+- live connection status
 - microphone and accessibility permission status
-- local assistant and backend state
+- local assistant state
 - transcript history
 - quick debug controls
 
@@ -225,7 +209,7 @@ Responsibilities:
 - request runtime permissions for mic, notifications, camera, overlay, etc.
 - request system settings screens for accessibility and notification access
 - expose native methods to Flutter via `MethodChannel`
-- manage backend URL storage and Gemini-related features
+- manage WebSocket URL storage and Gemini-related features
 
 Relevant methods include:
 - `configureFlutterEngine`
@@ -247,8 +231,8 @@ It coordinates:
 - local speech recognition
 - audio focus
 - service states
-- backend communication
-- fallback behavior when the cloud backend is unavailable
+- direct Gemini Live communication
+- fallback behavior when Gemini is unavailable
 - overlay state and assistant UI events
 
 Important state values:
@@ -273,7 +257,7 @@ Responsibilities:
 This is the real-time streaming class used for audio playback and socket-based interaction.
 
 Features:
-- creates WebSocket connections to backend or Gemini live endpoints
+- creates WebSocket connections to Gemini Live
 - sends PCM audio chunks to the remote endpoint
 - receives model-generated audio responses
 - writes received audio to Android `AudioTrack`
@@ -315,7 +299,7 @@ This monitors notifications and can:
 - send direct replies to notification sources
 
 ### `LocalSttEngine.kt`
-Performs on-device speech recognition as a fallback path when the backend is unavailable or slow.
+Performs on-device speech recognition as a fallback path when live voice is unavailable.
 
 ### `LocalTtsEngine.kt`
 Wraps Android text-to-speech for local spoken output.
@@ -349,111 +333,15 @@ Runs voice activity detection to help determine whether a user is speaking and t
 
 ---
 
-## Backend (`backend/main.py`)
+## Live voice and local resilience
 
-The backend is the assistant brain and orchestration layer.
-
-### Runtime stack
-
-- Python
-- FastAPI
-- Uvicorn
-- WebSockets
-- Groq
-- Google GenAI
-- DeepSeek (OpenAI-compatible API)
-- numpy
-- httpx
-- python-dotenv
-
-### Core responsibilities
-
-The backend:
-- accepts audio over WebSocket
-- transcribes speech
-- decides intent
-- builds device action payloads
-- returns spoken output
-- streams audio back to device
-
-### Main audio and transcription functions
-
-- `_as_wav_bytes(audio_bytes)`
-- `_transcribe_with_vosk(audio_bytes)`
-- `_transcribe_with_openai_local(audio_bytes)`
-- `_transcribe_with_groq(audio_bytes)`
-- `transcribe_audio(audio_bytes)`
-
-These functions transcribe the client audio using multiple STT engines in order:
-
-1. Vosk
-2. OpenAI-compatible local Whisper
-3. Groq Whisper
-
-### LLM and decision functions
-
-- `_build_spoken_text(action, args)`
-- `_map_function_call(name, args)`
-- `_run_gemini(contents, config)`
-- `_extract_json_block(text)`
-- `_standardize_decision(parsed)`
-- `_deepseek_llm_decision(...)`
-- `_groq_llm_decision(...)`
-- `_gemini_decision(...)`
-- `get_llm_decision(...)`
-
-The system tries these decision backends in order:
-
-1. rule-based direct command mapping
-2. DeepSeek
-3. Groq
-4. Gemini
-5. final fallback rule handling
-
-This ensures fast, deterministic action decisions before falling back to more expensive models.
-
-### TTS and streaming
-
-- `_generate_speech_sync(text)`
-- `stream_tts(text, websocket)`
-- `TTSManager`
-- `JSONReplyStreamer`
-
-These classes stream spoken phrases back over the WebSocket in a way the Android app can play in real time.
-
-### Full pipeline
-
-`process_speech_command(audio_bytes, websocket, history)` orchestrates the whole assistant flow:
-
-1. transcribe audio
-2. send transcript back to client
-3. ask the decision engine for the next step
-4. generate spoken response
-5. dispatch a device action if needed
-6. end with `RESPONSE_COMPLETE`
-7. store conversation memory
-
-### HTTP endpoints
-
-- `/` – project status summary
-- `/health` – health check
-
-### WebSocket endpoint
-
-- `/ws/audio`
-
-This endpoint handles:
-- binary voice chunks
-- WAKE trigger messages
-- END_OF_SPEECH signals
-- transcript and spoken reply messages
-- per-connection memory history
+The Android `AudioStreamer` sends 16 kHz PCM directly to Gemini Live and plays returned 24 kHz PCM as it arrives. Response text is streamed to the Flutter overlay as it is generated, then saved to conversation history once the audio turn completes. Native events are sequenced on the main thread and include a session ID so stale updates cannot roll the dashboard backward. Local VAD, a rolling onset buffer, deterministic command handling, and `LocalSttEngine`/`LocalTtsEngine` fallback keep device control usable without an intermediary server. A custom WebSocket URL remains configurable for deployments that provide a compatible service, but that service is not part of this repository.
 
 ---
 
 ## Supported commands and device actions
 
-The backend and Android tool layer support a broad set of phone actions.
+The Android action layer supports a broad set of phone actions.
 
 ### App and navigation actions
 - open app
@@ -505,48 +393,22 @@ And compound actions are also supported:
 
 ---
 
-## Backend environment configuration
+## Gemini configuration
 
-The backend loads values from environment variables and `.env` files.
-
-### Main environment variables
-
-- `GROQ_API_KEY`
-- `GROQ_TTS_VOICE`
-- `GEMINI_API_KEY`
-- `DEEPSEEK_API_KEY`
-- `DEEPSEEK_BASE_URL`
-- `DEEPSEEK_MODEL`
-- `GEMINI_MODEL`
-- `VOSK_MODEL_PATH`
-- `OPENAI_LOCAL_URL`
-- `OPENAI_LOCAL_API_KEY`
-- `OPENAI_LOCAL_MODEL`
-
-These values drive voice transcription, LLM decisions, and speech synthesis.
+Set `GEMINI_API_KEY` in `.env` or configure it in the dashboard. Native code uses the configured Gemini Live model and preserves the existing `com.example.hey_bro/assistant` and `com.example.hey_bro/events` channel contracts.
 
 ---
 
 ## Local development setup
 
-### Flutter app
+Install Flutter and the Android SDK, then run:
 
 ```bash
 flutter pub get
+flutter analyze
+flutter test
 flutter run
 ```
-
-### Python backend
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python run.py
-```
-
-The backend starts with Uvicorn and exposes the WebSocket endpoint used by the Android app.
 
 ---
 
@@ -587,18 +449,17 @@ If a new developer is joining the project, the best files to review first are:
 2. `android/app/src/main/kotlin/com/example/hey_bro/CoreVoiceService.kt` – main service orchestration
 3. `android/app/src/main/kotlin/com/example/hey_bro/DeviceOperatorService.kt` – device action engine
 4. `android/app/src/main/kotlin/com/example/hey_bro/AudioStreamer.kt` – realtime audio/WebSocket layer
-5. `backend/main.py` – full voice-to-action pipeline
-6. `project_details.md` – deeper architectural reference
+5. `project_details.md` – deeper architectural reference
 
 ---
 
 ## Summary
 
-Hey Bro is a full-stack AI voice assistant that spans:
+Hey Bro is an edge-first voice assistant that spans:
 
 - Flutter app UI
 - Android native automation layer
-- backend transcription and tool selection
+- direct Gemini Live transcription and tool selection
 - real device actions through Accessibility APIs
 - TTS and response playback
 

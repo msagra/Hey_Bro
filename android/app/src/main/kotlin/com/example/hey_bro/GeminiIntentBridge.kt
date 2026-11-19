@@ -51,12 +51,16 @@ class GeminiIntentBridge(private val context: Context) {
                 })
             }
 
-            val restModel = BuildConfig.GEMINI_REST_MODEL.ifBlank { "gemini-3.5-flash" }
-            val modelsToTry = if (restModel == "gemini-3.5-flash") {
-                listOf("gemini-3.5-flash", "gemini-3.8-flash", "gemini-flash-latest")
+            val configuredModel = BuildConfig.GEMINI_REST_MODEL.trim()
+            val primaryModel = configuredModel.takeIf {
+                it == "gemini-3.8-flash" || it == "gemini-3.5-flash"
+            } ?: "gemini-3.8-flash"
+            val fallbackModel = if (primaryModel == "gemini-3.8-flash") {
+                "gemini-3.5-flash"
             } else {
-                listOf(restModel, "gemini-3.5-flash", "gemini-flash-latest")
+                "gemini-3.8-flash"
             }
+            val modelsToTry = listOf(primaryModel, fallbackModel)
             var responseCode = -1
             var raw = ""
 
@@ -90,7 +94,7 @@ class GeminiIntentBridge(private val context: Context) {
                     if (raw.isNotBlank()) break
                 } catch (e: Exception) {
                     Log.w("GeminiIntentBridge", "Error calling $model: ${e.message}")
-                    break
+                    continue
                 }
             }
 

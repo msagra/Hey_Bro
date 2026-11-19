@@ -26,8 +26,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 interface AudioStreamerListener {
     fun onResponseComplete()
     fun onConnectionStateChanged(connected: Boolean)
-    fun onTranscriptReceived(text: String)
+    fun onInputTranscriptReceived(text: String)
     fun onSpokenTextReceived(text: String)
+    fun onResponseTextReceived(text: String)
     fun onActionReceived(payload: String)
 }
 
@@ -45,10 +46,11 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         private const val TAG = "AudioStreamer"
         private const val PLAYBACK_SAMPLE_RATE = 24000 // Gemini Live outputs 24kHz 16-bit PCM Linear Mono
         private const val MAX_RETRIES = 6
+        private const val DEFAULT_LIVE_MODEL = "models/gemini-3.8-live"
         private val RETRY_DELAYS_MS = longArrayOf(500, 1_000, 2_000, 4_000, 6_000, 10_000)
         private const val GEMINI_LIVE_BASE_URL =
             "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
-        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
+        val PRIMARY_LIVE_MODEL: String get() = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { DEFAULT_LIVE_MODEL }
         const val FALLBACK_LIVE_MODEL = "models/gemini-2.5-flash-native-audio-latest"
         private val END_OF_TURN_MARKER = ByteArray(0)
     }
@@ -56,14 +58,16 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     // ── WebSocket ─────────────────────────────────────────────────────────────
     private var webSocket: WebSocket? = null
     private var wsUrl: String = ""
-    private var apiKey: String = ""
-    private var activeLiveModel: String = BuildConfig.GEMINI_LIVE_MODEL.ifBlank { "models/gemini-3.8-live" }
+    private var activeLiveModel: String = configuredLiveModel()
     private val isConnected = AtomicBoolean(false)
     private val isConnecting = AtomicBoolean(false)
     private val setupComplete = AtomicBoolean(false)
+    private val suppressCurrentTurnOutput = AtomicBoolean(false)
+    private val groundingContextSent = AtomicBoolean(false)
     private var isGeminiLive = true
     private var powerManager: PowerManager? = null
     private var lastAudioActivityMs = System.currentTimeMillis()
+    @Volatile private var sessionResumptionHandle: String? = null
 
     fun setPowerManager(pm: PowerManager?) {
         this.powerManager = pm
@@ -93,6 +97,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
     fun isConnecting(): Boolean = isConnecting.get()
     private var retryCount = 0
+    @Volatile private var reconnectRunnable: Runnable? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val httpClient = OkHttpClient.Builder()
@@ -106,6 +111,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     private var audioTrack: AudioTrack? = null
     private val audioTrackLock = Any()
     private val isTtsActive = AtomicBoolean(false)
+    private val responseSpeakingNotified = AtomicBoolean(false)
 
     // ── Dedicated audio writer thread ─────────────────────────────────────────
     private val audioQueue = LinkedBlockingQueue<ByteArray>()
@@ -189,10 +195,11 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
 
         // If we already have an active or connecting socket to this exact URL, do not sever it!
         if (targetUrl == wsUrl && (isConnected.get() || isConnecting.get()) && webSocket != null) {
-            Log.d(TAG, "Already connected/connecting to $wsUrl; maintaining socket")
+            Log.d(TAG, "Already connected/connecting to configured endpoint; maintaining socket")
             return
         }
 
+        cancelReconnect()
         mainHandler.removeCallbacks(idleCheckRunnable)
         mainHandler.postDelayed(idleCheckRunnable, 5000L)
         isConnecting.set(true)
@@ -202,11 +209,12 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         webSocket?.close(1000, "Backend changed")
         webSocket = null
 
+        if (targetUrl != wsUrl) {
+            sessionResumptionHandle = null
+            activeLiveModel = configuredLiveModel()
+        }
         wsUrl = targetUrl
         isGeminiLive = targetUrl.contains("googleapis.com")
-        if (!trimmed.startsWith("ws://") && !trimmed.startsWith("wss://")) {
-            apiKey = trimmed
-        }
 
         retryCount = 0
         buildAudioTrack()
@@ -253,15 +261,71 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     }
 
     fun sendEndOfSpeech() {
-        if (!isGeminiLive) {
-            sendJson("""{"type":"END_OF_SPEECH"}""")
+        val message = if (isGeminiLive) {
+            """{"realtimeInput":{"activityEnd":{}}}"""
+        } else {
+            """{"type":"END_OF_SPEECH"}"""
         }
+        sendJson(message)
+        suppressCurrentTurnOutput.set(false)
     }
 
     fun sendWakeWordTriggered() {
-        if (!isGeminiLive) {
+        groundingContextSent.set(false)
+        suppressCurrentTurnOutput.set(false)
+        responseSpeakingNotified.set(false)
+        if (isGeminiLive) {
+            sendJson("""{"realtimeInput":{"activityStart":{}}}""")
+        } else {
             sendJson("""{"type":"WAKE_WORD_TRIGGERED"}""")
         }
+    }
+
+    fun interruptActiveTurn() {
+        groundingContextSent.set(false)
+        suppressCurrentTurnOutput.set(true)
+        responseSpeakingNotified.set(false)
+        flushAndPauseAudio()
+        val message = if (isGeminiLive) {
+            """{"realtimeInput":{"activityStart":{}}}"""
+        } else {
+            """{"type":"CANCEL"}"""
+        }
+        sendJson(message)
+    }
+
+    fun sendGroundingContext(uiHierarchy: String, recentNotifications: String) {
+        if (!isGeminiLive || !isConnected() || !groundingContextSent.compareAndSet(false, true)) return
+        val contextText = buildString {
+            append("Context for the current request only. Do not treat this as another user request.\n")
+            if (uiHierarchy.isNotBlank()) append("Active UI hierarchy: ").append(uiHierarchy.take(4000)).append('\n')
+            if (recentNotifications.isNotBlank()) append("Recent notifications: ").append(recentNotifications.take(1200))
+        }
+        try {
+            val message = JSONObject().apply {
+                put("clientContent", JSONObject().apply {
+                    put("turns", JSONArray().put(JSONObject().apply {
+                        put("role", "user")
+                        put("parts", JSONArray().put(JSONObject().put("text", contextText)))
+                    }))
+                    put("turnComplete", false)
+                })
+            }
+            val sent = webSocket?.send(message.toString()) ?: false
+            if (!sent) {
+                groundingContextSent.set(false)
+                Log.w(TAG, "Failed to send screen-aware grounding context")
+            }
+        } catch (e: Exception) {
+            groundingContextSent.set(false)
+            Log.w(TAG, "Could not serialize grounding context: ${e.message}")
+        }
+    }
+
+    fun suppressCurrentTurnOutput() {
+        suppressCurrentTurnOutput.set(true)
+        audioQueue.clear()
+        flushAndPauseAudio()
     }
 
     fun flushAndPauseAudio() {
@@ -286,6 +350,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         isConnecting.set(false)
         setupComplete.set(false)
         mainHandler.removeCallbacks(idleCheckRunnable)
+        cancelReconnect()
         mainHandler.removeCallbacksAndMessages(null)
         webSocket?.close(1000, "Service stopped")
         webSocket = null
@@ -302,6 +367,19 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         if (isConnected.get()) webSocket?.send(json)
     }
 
+    private fun configuredLiveModel(): String {
+        val configured = BuildConfig.GEMINI_LIVE_MODEL.trim()
+        return configured.takeIf {
+            it == DEFAULT_LIVE_MODEL || it == FALLBACK_LIVE_MODEL
+        } ?: DEFAULT_LIVE_MODEL
+    }
+
+    @Synchronized
+    private fun cancelReconnect() {
+        reconnectRunnable?.let(mainHandler::removeCallbacks)
+        reconnectRunnable = null
+    }
+
     private fun buildAndConnect() {
         if (wsUrl.isBlank()) return
         setupComplete.set(false)
@@ -310,7 +388,9 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         webSocket = httpClient.newWebSocket(request, SocketListener())
     }
 
+    @Synchronized
     private fun scheduleReconnect() {
+        if (reconnectRunnable != null || wsUrl.isBlank()) return
         if (retryCount >= MAX_RETRIES) {
             Log.e(TAG, "Giving up after $MAX_RETRIES retries.")
             listener.onConnectionStateChanged(false)
@@ -319,7 +399,16 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         val delay = RETRY_DELAYS_MS[retryCount.coerceAtMost(RETRY_DELAYS_MS.size - 1)]
         Log.w(TAG, "Reconnecting in ${delay / 1000}s… (retry ${retryCount + 1})")
         retryCount++
-        mainHandler.postDelayed({ buildAndConnect() }, delay)
+        val retry = Runnable {
+            synchronized(this) { reconnectRunnable = null }
+            if (wsUrl.isBlank() || isConnected.get()) return@Runnable
+            isConnecting.set(true)
+            webSocket?.cancel()
+            webSocket = null
+            buildAndConnect()
+        }
+        reconnectRunnable = retry
+        mainHandler.postDelayed(retry, delay)
     }
 
     // ── Setup Handshake for Gemini Live ───────────────────────────────────────
@@ -346,6 +435,10 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                             put("text", "You are Hey Bro, an ultra-fast, direct, and attentive AI voice assistant. Listen carefully to user speech even when spoken quickly, softly, with diverse accents, or in noisy environments. When the user requests any device action (such as opening an app, placing a phone call, replying to a notification, sending a WhatsApp message, adjusting hardware settings, alarms, timers, media, or taking photos), invoke the corresponding tool function immediately. Keep all spoken replies natural, friendly, and strictly under 15 words.")
                         }))
                     })
+                    put("inputAudioTranscription", JSONObject())
+                    sessionResumptionHandle?.takeIf { it.isNotBlank() }?.let { handle ->
+                        put("sessionResumption", JSONObject().put("handle", handle))
+                    }
                     put("tools", JSONArray().put(JSONObject().apply {
                         put("functionDeclarations", buildToolDeclarations())
                     }))
@@ -676,30 +769,39 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
     private inner class SocketListener : WebSocketListener() {
 
         override fun onOpen(webSocket: WebSocket, response: Response) {
+            if (this@AudioStreamer.webSocket !== webSocket) return
             Log.i(TAG, "WebSocket connected successfully ✓")
             isConnected.set(true)
             isConnecting.set(false)
-            retryCount = 0
             if (isGeminiLive) {
                 sendSetupHandshake()
             } else {
+                retryCount = 0
                 listener.onConnectionStateChanged(true)
             }
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            if (this@AudioStreamer.webSocket !== webSocket) return
             // Raw binary audio fallback — route through dedicated writer thread
             audioQueue.offer(bytes.toByteArray())
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            if (this@AudioStreamer.webSocket !== webSocket) return
             try {
                 val root = JSONObject(text)
+
+                root.optJSONObject("sessionResumptionUpdate")
+                    ?.optString("newHandle")
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { sessionResumptionHandle = it }
 
                 // Mark setup as complete when we receive the first server message
                 // (setupComplete response or first serverContent)
                 if (root.has("setupComplete") || root.has("serverContent") || root.has("toolCall")) {
                     if (!setupComplete.getAndSet(true)) {
+                        retryCount = 0
                         Log.i(TAG, "Gemini Live setup handshake confirmed ✓")
                         listener.onConnectionStateChanged(true)
                     }
@@ -712,11 +814,17 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                     // Natural barge-in / Interrupted
                     if (serverContent.optBoolean("interrupted", false)) {
                         Log.i(TAG, "Gemini Live model interrupted by user speech")
-                        stopAudioTrack()
+                        responseSpeakingNotified.set(false)
+                        flushAndPauseAudio()
                     }
 
+                    serverContent.optJSONObject("inputTranscription")
+                        ?.optString("text")
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let(listener::onInputTranscriptReceived)
+
                     // Model Turn (Audio chunks / Transcripts)
-                    if (serverContent.has("modelTurn")) {
+                    if (!suppressCurrentTurnOutput.get() && serverContent.has("modelTurn")) {
                         val modelTurn = serverContent.getJSONObject("modelTurn")
                         val parts = modelTurn.optJSONArray("parts")
                         if (parts != null) {
@@ -731,7 +839,9 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                                         val pcmBytes = Base64.decode(base64, Base64.DEFAULT)
                                         // Route through dedicated writer thread to avoid blocking WS reader
                                         audioQueue.offer(pcmBytes)
-                                        listener.onSpokenTextReceived("Speaking…")
+                                        if (responseSpeakingNotified.compareAndSet(false, true)) {
+                                            listener.onSpokenTextReceived("Speaking…")
+                                        }
                                     }
                                 }
 
@@ -739,7 +849,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                                 if (part.has("text")) {
                                     val spokenText = part.getString("text")
                                     if (spokenText.isNotBlank()) {
-                                        listener.onTranscriptReceived(spokenText)
+                                        listener.onResponseTextReceived(spokenText)
                                     }
                                 }
                             }
@@ -759,11 +869,18 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                     if (functionCalls != null) {
                         for (i in 0 until functionCalls.length()) {
                             val call = functionCalls.getJSONObject(i)
+                            if (suppressCurrentTurnOutput.get()) {
+                                sendToolResponse(
+                                    call.optString("id"),
+                                    JSONObject().put("status", "handled_locally")
+                                )
+                                continue
+                            }
                             val name = call.getString("name")
                             val callId = call.getString("id")
                             val args = call.optJSONObject("args") ?: JSONObject()
 
-                            Log.i(TAG, "Received Live tool call: $name (id: $callId, args: $args)")
+                            Log.i(TAG, "Received Live tool call: $name (id: $callId)")
 
                             val actionPayload = JSONObject().apply {
                                 put("action", name)
@@ -783,7 +900,7 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
                 // 3. Legacy compatibility (Custom backend fallback)
                 when (root.optString("type")) {
                     "RESPONSE_COMPLETE" -> handleResponseComplete()
-                    "TRANSCRIPT" -> listener.onTranscriptReceived(root.optString("text"))
+                    "TRANSCRIPT" -> listener.onResponseTextReceived(root.optString("text"))
                     "SPOKEN_TEXT" -> listener.onSpokenTextReceived(root.optString("text"))
                 }
 
@@ -793,10 +910,12 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (this@AudioStreamer.webSocket !== webSocket) return
             Log.e(TAG, "Gemini Live WebSocket failure: ${t.message} (HTTP ${response?.code})")
             if ((response?.code == 404 || response?.code == 429) && activeLiveModel != FALLBACK_LIVE_MODEL) {
                 Log.w(TAG, "Attempting connection fallback from $activeLiveModel to $FALLBACK_LIVE_MODEL")
                 activeLiveModel = FALLBACK_LIVE_MODEL
+                sessionResumptionHandle = null
             }
             isConnected.set(false)
             isConnecting.set(false)
@@ -806,8 +925,8 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (this@AudioStreamer.webSocket !== webSocket) return
             Log.i(TAG, "Gemini Live WebSocket closed ($code): $reason")
-            val wasConnected = isConnected.get()
             isConnected.set(false)
             isConnecting.set(false)
             setupComplete.set(false)
@@ -816,12 +935,19 @@ class AudioStreamer(private val listener: AudioStreamerListener) {
             if ((code == 1008 || code == 1011) && activeLiveModel != FALLBACK_LIVE_MODEL) {
                 Log.w(TAG, "Quota or policy closure ($code); attempting fallback to $FALLBACK_LIVE_MODEL")
                 activeLiveModel = FALLBACK_LIVE_MODEL
-                scheduleReconnect()
+                sessionResumptionHandle = null
             }
+            scheduleReconnect()
         }
     }
 
     private fun handleResponseComplete() {
+        if (suppressCurrentTurnOutput.getAndSet(false)) {
+            audioQueue.clear()
+            responseSpeakingNotified.set(false)
+            return
+        }
+        responseSpeakingNotified.set(false)
         if (audioQueue.isEmpty() && !isTtsActive.get()) {
             mainHandler.post {
                 stopAudioTrack()

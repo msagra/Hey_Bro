@@ -74,6 +74,23 @@ class HeyBroNotificationListenerService : NotificationListenerService() {
             }
         }
 
+        fun getCompactRecentSummaries(limit: Int = 3): String {
+            val items = notificationCache.values
+                .filter { it.text.isNotBlank() }
+                .sortedByDescending { it.postedAt }
+                .take(limit.coerceIn(1, 5))
+            return org.json.JSONArray().apply {
+                items.forEach { item ->
+                    put(org.json.JSONObject().apply {
+                        put("packageName", item.packageName.take(120))
+                        put("app", item.appLabel.take(60))
+                        put("title", item.title.take(80))
+                        put("text", item.text.take(160))
+                    })
+                }
+            }.toString()
+        }
+
         fun sendDirectReply(packageName: String?, replyMessage: String, contactOrApp: String? = null): Boolean {
             return instance?.replyToNotification(packageName, replyMessage, contactOrApp) ?: false
         }

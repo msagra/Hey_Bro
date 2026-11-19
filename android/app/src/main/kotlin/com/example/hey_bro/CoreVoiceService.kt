@@ -35,6 +35,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 enum class ServiceState { IDLE, LISTENING, PROCESSING, SPEAKING }
 
@@ -64,6 +66,19 @@ class CoreVoiceService : Service(),
 
         fun updateBackendWs(url: String) {
             activeInstance?.applyBackendWs(url)
+        }
+
+        fun reportActionProgress(step: Int, status: String, error: String) {
+            activeInstance?.pushEvent(mapOf(
+                "type" to "action_progress",
+                "step" to step.toString(),
+                "stepStatus" to status,
+                "stepError" to error.take(160)
+            ))
+        }
+
+        fun syncStateToFlutter() {
+            activeInstance?.publishCurrentState()
         }
     }
 
@@ -145,14 +160,20 @@ class CoreVoiceService : Service(),
     private var audioStreamer:   AudioStreamer?   = null
     private var backendWsUrl:    String? = null
     private var awaitingCommandAfterAck: Boolean = false
-    private var lastBackendTranscript = ""
+    @Volatile private var lastBackendTranscript = ""
+    private val backendResponseLock = Any()
+    private var lastBackendResponse = ""
     private val dispatchedActionLock = Any()
-    private var lastDispatchedActionSignature = ""
-    private var lastDispatchedActionAtMs = 0L
+    private val dispatchedActionSignatures = mutableSetOf<String>()
+    private val fastPathSignaturesThisTurn = mutableSetOf<String>()
+    private var lastHandledSttTranscript = ""
     @Volatile private var serviceDestroyed = false
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private val backendResponseHandler = mainHandler
     private var backendFallbackPending = false
+    private val sessionId = UUID.randomUUID().toString()
+    private val eventSequence = AtomicLong(0L)
+    @Volatile private var pendingSensitiveAction: String? = null
 
     private val backendFallbackRunnable = Runnable {
         if (!serviceDestroyed && backendFallbackPending && serviceState == ServiceState.LISTENING) {
@@ -168,6 +189,7 @@ class CoreVoiceService : Service(),
     private val audioRecordLock = Any()
     private var audioJob:    Job?         = null
     private var captureJob: Job? = null
+    private var localBargeInJob: Job? = null
     @Volatile private var captureAudioRecord: AudioRecord? = null
 
     private val startWakeWordRunnable = Runnable {
@@ -215,7 +237,6 @@ class CoreVoiceService : Service(),
     private val serviceJob = Job()
     private val scope = CoroutineScope(Dispatchers.IO + serviceJob)
 
-    private val PICOVOICE_ACCESS_KEY = "YOUR_PICOVOICE_ACCESS_KEY_HERE"
     private var cpuWakeLock: PowerManager.WakeLock? = null
     private var lastWakeAtMs = 0L
     private var lastFailedListenAtMs = 0L
@@ -265,6 +286,9 @@ class CoreVoiceService : Service(),
 
         initWakeWordEngine()
         initVAD()
+        mainHandler.post {
+            if (!serviceDestroyed) publishCurrentState()
+        }
     }
 
     private fun configureBackendStreamer() {
@@ -296,13 +320,17 @@ class CoreVoiceService : Service(),
         backendWsUrl = target
         audioStreamer = AudioStreamer(object : AudioStreamerListener {
             override fun onResponseComplete() {
+                if (serviceState != ServiceState.SPEAKING) return
                 cancelBackendFallback()
                 abandonAudioFocus()
-                if (serviceState != ServiceState.IDLE) {
-                    resetToIdle()
-                    pushEvent(mapOf("state" to "IDLE"))
-                    overlayManager.hideDelayed(300)
-                }
+                resetToIdle()
+                pushEvent(mapOf(
+                    "state" to "IDLE",
+                    "responseComplete" to "true",
+                    "transcript" to lastBackendTranscript,
+                    "response" to currentBackendResponse()
+                ))
+                overlayManager.hideDelayed(300)
             }
             override fun onConnectionStateChanged(connected: Boolean) {
                 Log.i(TAG, "AudioStreamer connected=$connected")
@@ -313,47 +341,230 @@ class CoreVoiceService : Service(),
                 if (!connected && serviceState == ServiceState.LISTENING) {
                     backendFallbackPending = false
                     backendResponseHandler.removeCallbacks(backendFallbackRunnable)
-                    captureJob?.cancel()
+                    stopCaptureAudio()
                     requestAudioFocus()
                     sttEngine.startListening()
                 }
             }
-            override fun onTranscriptReceived(text: String) {
+            override fun onResponseTextReceived(text: String) {
                 if (text.trim().matches(Regex("^[^\\p{L}\\p{N}]+$"))) {
-                    Log.d(TAG, "Ignoring punctuation-only backend transcript: '$text'")
+                    Log.d(TAG, "Ignoring punctuation-only response text")
+                    return
+                }
+                mainHandler.post {
+                    if (serviceDestroyed || text.isBlank()) return@post
+                    cancelBackendFallback()
+                    appendBackendResponse(text)
+                    transitionTo(ServiceState.SPEAKING)
+                    val response = currentBackendResponse()
+                    pushEvent(mapOf(
+                        "state" to "PLAYING",
+                        "transcript" to lastBackendTranscript,
+                        "response" to response,
+                        "responseStreaming" to "true"
+                    ))
+                    overlayManager.show(OverlayManager.State.PLAYING, response.takeLast(40))
+                }
+            }
+            override fun onInputTranscriptReceived(text: String) {
+                mainHandler.post {
+                    if (serviceDestroyed) return@post
+                    if (isScreenAwareRequest(text)) {
+                        val ui = DeviceOperatorService.instance?.serializeActiveUiHierarchy().orEmpty()
+                        val notifications = HeyBroNotificationListenerService.getCompactRecentSummaries()
+                        audioStreamer?.sendGroundingContext(ui, notifications)
+                    }
+                    lastBackendTranscript = text
+                    handleInputTranscript(text)
+                }
+            }
+            override fun onSpokenTextReceived(text: String) {
+                mainHandler.post {
+                    if (serviceDestroyed) return@post
+                    cancelBackendFallback()
+                    transitionTo(ServiceState.SPEAKING)
+                    if (text != "Speaking…") {
+                        appendBackendResponse(text)
+                    }
+                    val response = currentBackendResponse()
+                    pushEvent(buildMap {
+                        put("state", "PLAYING")
+                        put("transcript", lastBackendTranscript)
+                        if (text != "Speaking…") {
+                            put("response", response)
+                            put("responseStreaming", "true")
+                        }
+                    })
+                    overlayManager.show(OverlayManager.State.PLAYING, response.takeLast(40).ifBlank { text.take(40) })
+                }
+            }
+
+            private fun handleInputTranscript(text: String) {
+                if (serviceState !in setOf(ServiceState.LISTENING, ServiceState.PROCESSING, ServiceState.SPEAKING)) return
+                if (handlePendingConfirmation(text)) return
+                val result = LocalCommandProcessor.checkFastPath(text) ?: return
+                val action = result.action ?: return
+                val signature = actionSignature(action.toString())
+                synchronized(dispatchedActionLock) {
+                    if (signature.isNotBlank() &&
+                        (signature in fastPathSignaturesThisTurn || signature in dispatchedActionSignatures)
+                    ) {
+                        return
+                    }
+                    if (signature.isNotBlank()) fastPathSignaturesThisTurn.add(signature)
+                }
+
+                Log.i(TAG, "Executing local fast-path action while Gemini Live remains active")
+                if (requiresVoiceConfirmation(action.toString())) {
+                    requestVoiceConfirmation(action.toString())
                     return
                 }
                 cancelBackendFallback()
-                lastBackendTranscript = text
-                pushEvent(mapOf("state" to "PROCESSING", "transcript" to text))
-                overlayManager.show(OverlayManager.State.PROCESSING, text.take(40))
-            }
-            override fun onSpokenTextReceived(text: String) {
-                cancelBackendFallback()
+                closeLiveInputForLocalResponse()
+                dispatchDeviceCommand(action.toString())
                 transitionTo(ServiceState.SPEAKING)
-                pushEvent(mapOf(
-                    "state" to "PLAYING",
-                    "transcript" to lastBackendTranscript,
-                    "response" to text
-                ))
-                overlayManager.show(OverlayManager.State.PLAYING, text.take(40))
+                pushEvent(mapOf("state" to "PLAYING", "transcript" to text, "response" to result.reply))
+                overlayManager.show(OverlayManager.State.PLAYING, result.reply.take(40))
+                ttsEngine.speak(result.reply)
             }
             override fun onActionReceived(payload: String) {
-                cancelBackendFallback()
-                dispatchDeviceCommand(payload)
+                mainHandler.post {
+                    if (serviceDestroyed) return@post
+                    cancelBackendFallback()
+                    dispatchDeviceCommand(payload)
+                }
             }
         })
         audioStreamer?.setPowerManager(getSystemService(Context.POWER_SERVICE) as? PowerManager)
         audioStreamer?.connect(target)
     }
 
+    private fun isScreenAwareRequest(text: String): Boolean {
+        val normalized = text.lowercase()
+        return listOf("tap", "click", "type", "screen", "notification", "reply to")
+            .any { normalized.contains(it) }
+    }
+
+    private fun publishCurrentState() {
+        pushEvent(mapOf(
+            "stateSync" to "true",
+            "state" to when (serviceState) {
+                ServiceState.IDLE -> "IDLE"
+                ServiceState.LISTENING -> "LISTENING"
+                ServiceState.PROCESSING -> "PROCESSING"
+                ServiceState.SPEAKING -> "SPEAKING"
+            },
+            "wsConnected" to (audioStreamer?.isConnected() == true).toString()
+        ))
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startLocalTtsBargeInMonitor() {
+        if (localBargeInJob?.isActive == true || serviceDestroyed) return
+        localBargeInJob = scope.launch {
+            var recorder: AudioRecord? = null
+            var echoCanceler: AcousticEchoCanceler? = null
+            var noiseSuppressor: NoiseSuppressor? = null
+            try {
+                val frameSize = 512
+                val minimum = AudioRecord.getMinBufferSize(
+                    SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
+                )
+                recorder = createAudioRecord(SAMPLE_RATE, maxOf(minimum, frameSize * 4))
+                    ?: return@launch
+                val session = recorder.audioSessionId
+                if (AcousticEchoCanceler.isAvailable()) {
+                    echoCanceler = AcousticEchoCanceler.create(session)?.apply { enabled = true }
+                }
+                if (NoiseSuppressor.isAvailable()) {
+                    noiseSuppressor = NoiseSuppressor.create(session)?.apply { enabled = true }
+                }
+                recorder.startRecording()
+                sileroVad?.resetStates()
+                val frame = ShortArray(frameSize)
+                var speechFrames = 0
+                while (isActive && serviceState == ServiceState.SPEAKING) {
+                    val read = recorder.read(frame, 0, frame.size)
+                    if (read <= 0) continue
+                    var sum = 0.0
+                    for (i in 0 until read) {
+                        val sample = frame[i].toDouble() / Short.MAX_VALUE
+                        sum += sample * sample
+                    }
+                    val rms = kotlin.math.sqrt(sum / read).toFloat()
+                    val score = sileroVad?.isSpeech(frame, SAMPLE_RATE) ?: -1f
+                    if (score >= 0.38f || rms >= 0.018f) speechFrames++ else speechFrames = 0
+                    if (speechFrames >= 3) {
+                        try { recorder.stop() } catch (_: Throwable) {}
+                        mainHandler.post {
+                            if (serviceState == ServiceState.SPEAKING) {
+                                beginActionTurn()
+                                ttsEngine.stop()
+                                audioStreamer?.interruptActiveTurn()
+                                transitionTo(ServiceState.LISTENING)
+                                overlayManager.show(OverlayManager.State.LISTENING)
+                                pushEvent(mapOf("state" to "LISTENING"))
+                                requestAudioFocus()
+                                if (audioStreamer?.isConnected() == true) {
+                                    captureAndSendAudio()
+                                } else {
+                                    sttEngine.startListening()
+                                }
+                            }
+                        }
+                        break
+                    }
+                }
+            } catch (e: Exception) {
+                if (serviceState == ServiceState.SPEAKING) {
+                    Log.w(TAG, "Local TTS barge-in monitor failed: ${e.message}")
+                }
+            } finally {
+                try { noiseSuppressor?.release() } catch (_: Throwable) {}
+                try { echoCanceler?.release() } catch (_: Throwable) {}
+                try {
+                    if (recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder?.stop()
+                } catch (_: Throwable) {}
+                try { recorder?.release() } catch (_: Throwable) {}
+                localBargeInJob = null
+            }
+        }
+    }
+
     private fun dispatchDeviceCommand(payload: String, attemptsLeft: Int = 8) {
+        dispatchDeviceCommand(payload, attemptsLeft, confirmed = false)
+    }
+
+    private fun dispatchDeviceCommand(payload: String, attemptsLeft: Int, confirmed: Boolean) {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            mainHandler.post { dispatchDeviceCommand(payload, attemptsLeft, confirmed) }
+            return
+        }
+        val parsedPayload = try {
+            JSONObject(payload)
+        } catch (_: Exception) {
+            Log.w(TAG, "Rejecting malformed device operation")
+            return
+        }
+        if (!ActionPayloadValidator.isValidCommandEnvelope(
+                parsedPayload,
+                ExtendedOperations.EXTENDED_SETTINGS_ACTIONS.keys
+            )
+        ) {
+            Log.w(TAG, "Rejecting device operation with invalid schema")
+            return
+        }
+        if (!confirmed && requiresVoiceConfirmation(payload)) {
+            requestVoiceConfirmation(payload)
+            return
+        }
+
         val operator = DeviceOperatorService.instance
         if (operator == null) {
             if (attemptsLeft > 0 && !serviceDestroyed) {
                 Log.w(TAG, "Accessibility service not ready; retrying device operation")
                 backendResponseHandler.postDelayed({
-                    dispatchDeviceCommand(payload, attemptsLeft - 1)
+                    dispatchDeviceCommand(payload, attemptsLeft - 1, confirmed)
                 }, 250L)
             } else {
                 Log.e(TAG, "Dropping device operation: accessibility service unavailable")
@@ -362,38 +573,138 @@ class CoreVoiceService : Service(),
         }
 
         val signature = actionSignature(payload)
-        val now = SystemClock.elapsedRealtime()
         synchronized(dispatchedActionLock) {
-            if (signature.isNotBlank() &&
-                signature == lastDispatchedActionSignature &&
-                now - lastDispatchedActionAtMs < 5_000L
-            ) {
+            if (signature.isNotBlank() && signature in dispatchedActionSignatures) {
                 Log.d(TAG, "Skipping duplicate device operation: $signature")
                 return
             }
-            if (signature.isNotBlank()) {
-                lastDispatchedActionSignature = signature
-                lastDispatchedActionAtMs = now
-            }
+            if (signature.isNotBlank()) dispatchedActionSignatures.add(signature)
         }
 
-        Log.i(TAG, "Dispatching device operation: $payload")
-        operator.executeCommand(payload)
+        Log.i(TAG, "Dispatching device operation")
+        operator.executeCommand(payload, confirmed)
     }
+
+    private fun requiresVoiceConfirmation(payload: String): Boolean {
+        return try {
+            ActionPayloadValidator.requiresVoiceConfirmation(JSONObject(payload))
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun requestVoiceConfirmation(payload: String) {
+        if (pendingSensitiveAction != null) return
+        pendingSensitiveAction = payload
+        mainHandler.post {
+            if (serviceDestroyed || pendingSensitiveAction != payload) return@post
+            closeLiveInputForLocalResponse()
+            awaitingCommandAfterAck = true
+            transitionTo(ServiceState.SPEAKING)
+            val prompt = "This is a sensitive action. Say yes to confirm, or no to cancel."
+            pushEvent(mapOf("state" to "PLAYING", "response" to prompt))
+            overlayManager.show(OverlayManager.State.PLAYING, prompt)
+            ttsEngine.speak(prompt)
+        }
+    }
+
+    private fun handlePendingConfirmation(transcript: String): Boolean {
+        val payload = pendingSensitiveAction ?: return false
+        val answer = transcript.trim().lowercase()
+        closeLiveInputForLocalResponse()
+        val affirmative = answer.matches(Regex("^(yes|yeah|yep|confirm|do it|proceed)[.! ]*$"))
+        val negative = answer.matches(Regex("^(no|nope|cancel|stop|don't)[.! ]*$"))
+
+        if (affirmative) {
+            pendingSensitiveAction = null
+            transitionTo(ServiceState.PROCESSING)
+            dispatchDeviceCommand(payload, attemptsLeft = 8, confirmed = true)
+            val response = "Confirmed."
+            transitionTo(ServiceState.SPEAKING)
+            pushEvent(mapOf("state" to "PLAYING", "response" to response))
+            ttsEngine.speak(response)
+        } else if (negative) {
+            pendingSensitiveAction = null
+            transitionTo(ServiceState.SPEAKING)
+            val response = "Canceled."
+            pushEvent(mapOf("state" to "PLAYING", "response" to response))
+            ttsEngine.speak(response)
+        } else {
+            awaitingCommandAfterAck = true
+            transitionTo(ServiceState.SPEAKING)
+            ttsEngine.speak("Please say yes to confirm, or no to cancel.")
+        }
+        return true
+    }
+
+    private fun closeLiveInputForLocalResponse() {
+        if (captureJob?.isActive == true && audioStreamer?.isConnected() == true) {
+            audioStreamer?.sendEndOfSpeech()
+        }
+        audioStreamer?.suppressCurrentTurnOutput()
+        stopCaptureAudio()
+        ttsEngine.stop()
+    }
+
+    private fun beginActionTurn() {
+        synchronized(dispatchedActionLock) {
+            dispatchedActionSignatures.clear()
+            fastPathSignaturesThisTurn.clear()
+        }
+        lastBackendTranscript = ""
+        synchronized(backendResponseLock) { lastBackendResponse = "" }
+    }
+
+    private fun appendBackendResponse(text: String) {
+        synchronized(backendResponseLock) {
+            lastBackendResponse += text
+        }
+    }
+
+    private fun currentBackendResponse(): String =
+        synchronized(backendResponseLock) { lastBackendResponse }
 
     private fun actionSignature(payload: String): String {
         return try {
             val json = JSONObject(payload)
+            val params = JSONObject().apply {
+                json.optJSONObject("params")?.let { nested ->
+                    val keys = nested.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        put(key, nested.get(key))
+                    }
+
+                }
+                val keys = json.keys()
+                while (keys.hasNext()) {
+                    val key = keys.next()
+                    if (key !in setOf("params", "type", "reply", "voiceConfirmed")) {
+                        if (!has(key)) put(key, json.get(key))
+                    }
+                }
+            }
             val action = json.optString("action")
-            val params = json.optJSONObject("params")
             when (action) {
                 "flashlightOn", "flashlightOff" -> "flashlight:${action == "flashlightOn"}"
+                "controlHardware" -> {
+                    val device = params.optString("device").lowercase()
+                    val state = params.optString("state").lowercase()
+                    when (device) {
+                        "flashlight", "wifi", "bluetooth", "airplane" ->
+                            if (state in setOf("on", "off")) "$device:${state == "on"}" else "$device:$state"
+                        "volume" -> "volume:${if (state in setOf("increase", "up")) "up" else if (state in setOf("decrease", "down")) "down" else state}"
+                        else -> "$device:$state"
+                    }
+                }
+                "toggleWifi" -> "wifi:${params.optBoolean("enabled", true)}"
+                "toggleBluetooth" -> "bluetooth:${params.optBoolean("enabled", true)}"
                 "volumeUp" -> "volume:up"
                 "volumeDown" -> "volume:down"
                 "mute" -> "volume:mute"
                 "globalBack" -> "global:back"
                 "globalHome" -> "global:home"
-                else -> "$action:${params?.toString() ?: json.toString()}"
+                else -> "$action:${params}"
             }
         } catch (_: Exception) {
             ""
@@ -402,7 +713,7 @@ class CoreVoiceService : Service(),
 
     private fun applyBackendWs(url: String) {
         val trimmed = url.trim()
-        Log.i(TAG, "Backend switch request: '$url'")
+        Log.i(TAG, "Backend switch requested")
         val apiKey = prefs.getString("gemini_api_key", "")?.trim().let { if (it.isNullOrBlank()) DEFAULT_GEMINI_KEY else it }
         if (trimmed.equals("offline", ignoreCase = true)) {
             backendWsUrl = null
@@ -502,6 +813,8 @@ class CoreVoiceService : Service(),
         cancelStateWatchdog()
         cancelSttRetry()
         stopCaptureAudio()
+        localBargeInJob?.cancel()
+        localBargeInJob = null
         cancelBackendFallback()
         backendResponseHandler.removeCallbacksAndMessages(null)
         try { audioStreamer?.stopAll() } catch (_: Exception) {}
@@ -544,17 +857,22 @@ class CoreVoiceService : Service(),
 
     override fun onSpeechBegin() {
         Log.d(TAG, "User began speaking")
+        lastHandledSttTranscript = ""
         sttFailureCount = 0
         sttRetryInFlight = false
         abandonAudioFocus()
     }
 
     override fun onResult(transcript: String) {
+        val transcriptKey = transcript.trim().lowercase().replace(Regex("\\s+"), " ")
+        if (transcriptKey.isBlank() || transcriptKey == lastHandledSttTranscript) return
+        lastHandledSttTranscript = transcriptKey
         sttFailureCount = 0
         sttRetryInFlight = false
         abandonAudioFocus()
 
-        Log.i(TAG, "STT result: \"$transcript\"")
+        Log.i(TAG, "STT result received (${transcript.length} characters)")
+        if (handlePendingConfirmation(transcript)) return
         transitionTo(ServiceState.PROCESSING)
         pushEvent(mapOf("state" to "PROCESSING", "transcript" to transcript))
         overlayManager.show(OverlayManager.State.PROCESSING)
@@ -573,6 +891,11 @@ class CoreVoiceService : Service(),
                 Log.d(TAG, "Executing action: $actionStr")
                 VoiceLearningStore.learn(transcript, actionStr)
 
+                if (requiresVoiceConfirmation(actionJson.toString())) {
+                    requestVoiceConfirmation(actionJson.toString())
+                    return@launch
+                }
+
                 if (actionStr == "sleep") {
                     resetToIdle()
                     pushEvent(mapOf("state" to "IDLE"))
@@ -581,7 +904,7 @@ class CoreVoiceService : Service(),
                     return@launch
                 }
 
-                DeviceOperatorService.instance?.executeCommand(actionJson.toString())
+                dispatchDeviceCommand(actionJson.toString())
             }
 
             kotlinx.coroutines.withContext(Dispatchers.Main) {
@@ -597,35 +920,9 @@ class CoreVoiceService : Service(),
         if (serviceState != ServiceState.LISTENING) return
 
         // Upgrade B2: Parallel Local Fast-Path (<50ms execution on first transcript chunk)
-        val fastResult = LocalCommandProcessor.checkFastPath(transcript)
+        val fastResult = LocalCommandProcessor.checkFastPath(transcript, partial = true)
         if (fastResult != null && fastResult.action != null) {
             Log.i(TAG, "High-confidence parallel fast-path triggered in <50ms: \"$transcript\"")
-            try { sttEngine.stopListening() } catch (_: Exception) {}
-            onResult(transcript)
-            return
-        }
-
-        val lower = transcript.lowercase().trim()
-        val fastActions = listOf(
-            "flashlight on", "turn on flashlight", "turn flashlight on",
-            "flashlight off", "turn off flashlight", "turn flashlight off",
-            "torch on", "turn on torch", "turn torch on",
-            "torch off", "turn off torch", "turn torch off",
-            "take photo", "take a photo", "take selfie", "take a selfie",
-            "take screenshot", "take a screenshot", "screenshot",
-            "volume up", "increase volume", "volume down", "decrease volume", "mute",
-            "wifi on", "turn on wifi", "wifi off", "turn off wifi",
-            "bluetooth on", "turn on bluetooth", "bluetooth off", "turn off bluetooth",
-            "hotspot on", "turn on hotspot", "hotspot off", "turn off hotspot",
-            "what is the time", "what time is it", "current time",
-            "battery level", "battery percentage", "how much battery",
-            "go back", "go home", "lock screen", "stop listening", "go to sleep"
-        )
-        val hasFastAction = fastActions.any { lower.contains(it) } ||
-            (lower.length >= 7 && LocalCommandProcessor.process(lower).action != null)
-
-        if (hasFastAction) {
-            Log.i(TAG, "High-confidence partial action detected: \"$transcript\" - executing immediately")
             try { sttEngine.stopListening() } catch (_: Exception) {}
             onResult(transcript)
         }
@@ -713,6 +1010,9 @@ class CoreVoiceService : Service(),
 
     override fun onSpeechStart() {
         Log.d(TAG, "TTS speaking")
+        if (serviceState == ServiceState.SPEAKING && captureJob?.isActive != true) {
+            startLocalTtsBargeInMonitor()
+        }
     }
 
     override fun onSpeechDone() {
@@ -762,7 +1062,7 @@ class CoreVoiceService : Service(),
 
     private fun initWakeWordEngine() {
         try {
-            wakeWordManager = WakeWordManager(applicationContext, PICOVOICE_ACCESS_KEY)
+            wakeWordManager = WakeWordManager(applicationContext)
             wakeWordManager?.initialize()
 
             val activeWakeEngine = wakeWordManager?.activeEngine
@@ -918,10 +1218,10 @@ class CoreVoiceService : Service(),
                     }
                     if (read != frameLength) continue
 
-                    // Check Silero VAD score to gate CPU processing
-                    val vadScore = try { sileroVad?.isSpeech(buffer, SAMPLE_RATE) ?: -1f } catch (_: Exception) { -1f }
-                    if (vadScore >= 0.35f) {
-                        // Upgrade B1: Speculative pre-warming of Gemini 3.8 Live WebSocket on speech onset
+                    var peak = 0
+                    for (sample in buffer) peak = maxOf(peak, kotlin.math.abs(sample.toInt()))
+                    if (peak >= 5_000) {
+                        // Prewarm on speech energy; HeyBroPhraseWakeEngine performs the sole wake VAD inference.
                         audioStreamer?.prewarm(backendWsUrl ?: "")
                     }
 
@@ -948,10 +1248,10 @@ class CoreVoiceService : Service(),
         val nowMs = SystemClock.elapsedRealtime()
 
         // Siri-like: If assistant is currently speaking, user saying "Hey Bro" interrupts immediately!
-        if (serviceState == ServiceState.SPEAKING) {
-            Log.i(TAG, "Siri-style interruption: stopping speech on wake phrase")
+        if (serviceState == ServiceState.SPEAKING || serviceState == ServiceState.PROCESSING) {
+            Log.i(TAG, "Interrupting active response on wake phrase")
             ttsEngine.stop()
-            audioStreamer?.interruptPlayback()
+            audioStreamer?.interruptActiveTurn()
             resetToIdle()
             mainHandler.postDelayed({
                 onWakeWordDetected(directCommand)
@@ -970,6 +1270,8 @@ class CoreVoiceService : Service(),
         }
 
         lastWakeAtMs = nowMs
+        beginActionTurn()
+        lastHandledSttTranscript = ""
 
         try {
             audioJob?.cancel()
@@ -1028,7 +1330,7 @@ class CoreVoiceService : Service(),
         // (e.g. "Hey bro turn on flashlight"), execute it immediately without interrupting
         // them with a spoken greeting!
         if (!directCommand.isNullOrBlank()) {
-            Log.i(TAG, "One-shot wake word with direct command: '$directCommand'")
+            Log.i(TAG, "One-shot wake word with a direct command")
             transitionTo(ServiceState.PROCESSING)
             overlayManager.show(OverlayManager.State.PROCESSING, directCommand.take(40))
             pushEvent(mapOf("state" to "PROCESSING", "transcript" to directCommand, "activeEngine" to activeEngineName))
@@ -1070,9 +1372,9 @@ class CoreVoiceService : Service(),
                 requestAudioFocus()
                 sttEngine.startListening()
             }
-        } else if (serviceState == ServiceState.SPEAKING) {
+        } else if (serviceState == ServiceState.SPEAKING || serviceState == ServiceState.PROCESSING) {
             ttsEngine.stop()
-            audioStreamer?.interruptPlayback()
+            audioStreamer?.interruptActiveTurn()
             resetToIdle()
             mainHandler.postDelayed({
                 onWakeWordDetected()
@@ -1083,6 +1385,8 @@ class CoreVoiceService : Service(),
     private fun resetToIdle() {
         cancelStateWatchdog()
         cancelSttRetry()
+        localBargeInJob?.cancel()
+        localBargeInJob = null
         transitionTo(ServiceState.IDLE)
         sileroVad?.resetStates()
         stopCaptureAudio()
@@ -1133,9 +1437,9 @@ class CoreVoiceService : Service(),
         serviceState = newState
         when (newState) {
             ServiceState.IDLE -> cancelStateWatchdog()
-            ServiceState.LISTENING -> scheduleStateWatchdog(10_000L, ServiceState.LISTENING)
-            ServiceState.PROCESSING -> scheduleStateWatchdog(12_000L, ServiceState.PROCESSING)
-            ServiceState.SPEAKING -> scheduleStateWatchdog(20_000L, ServiceState.SPEAKING)
+            ServiceState.LISTENING -> scheduleStateWatchdog(20_000L, ServiceState.LISTENING)
+            ServiceState.PROCESSING -> scheduleStateWatchdog(30_000L, ServiceState.PROCESSING)
+            ServiceState.SPEAKING -> scheduleStateWatchdog(45_000L, ServiceState.SPEAKING)
         }
     }
 
@@ -1203,6 +1507,7 @@ class CoreVoiceService : Service(),
                 }
                 recorder = createdRecorder
                 captureAudioRecord = createdRecorder
+                sileroVad?.resetStates()
 
                 try {
                     val sessionId = recorder.audioSessionId
@@ -1233,16 +1538,14 @@ class CoreVoiceService : Service(),
                 val shortBuf = ShortArray(frameSize)
                 var speechDetected = false
                 var silenceFrames = 0
-                // 24 frames at 32ms each = ~768ms silence tolerance
-                // This gives users natural space to pause and breathe without cut-offs!
-                val maxSilenceFrames = 24
+                val maxSilenceFrames = 12 // 384ms of sustained silence
                 var speechFramesCount = 0
-                val minSpeechFrames = 4 // Require ~128ms genuine speech before allowing EOS trigger
+                val minSpeechFrames = 3
                 val noSpeechTimeoutMs = 6000L
                 val maxDurationMs = 15000L
                 val startMs = SystemClock.elapsedRealtime()
 
-                // Rolling pre-roll ring buffer (~256ms) so opening consonants and words are never clipped
+                // Keep 256ms of audio so the first consonants survive VAD onset latency.
                 val preRollBuffer = ArrayDeque<ByteArray>(8)
 
                 // Dynamic Noise Floor Calibration with exponential moving average
@@ -1320,7 +1623,7 @@ class CoreVoiceService : Service(),
 
                     // 2. Query Silero VAD (with smoothed hysteresis)
                     val vadScore = try { sileroVad?.isSpeech(shortBuf, sampleRate) ?: -1f } catch (_: Exception) { -1f }
-                    val vadSmoothed = try { sileroVad?.isSpeechSmoothed(shortBuf, 0.32f, sampleRate) ?: false } catch (_: Exception) { false }
+                    val vadSmoothed = try { sileroVad?.smoothProbability(vadScore, 0.32f) ?: false } catch (_: Exception) { false }
 
                     // Adapt noise floor only during verified non-speech frames
                     if (!speechDetected && vadScore in 0f..0.20f) {
@@ -1343,25 +1646,32 @@ class CoreVoiceService : Service(),
                     }
 
                     if (!speechDetected) {
-                        // Keep last 8 frames (~256ms) in pre-roll buffer
                         if (preRollBuffer.size >= 8) {
                             preRollBuffer.removeFirst()
                         }
                         preRollBuffer.addLast(bytes)
 
                         if (isSpeechFrame) {
+                            val bargeIn = serviceState == ServiceState.PROCESSING || serviceState == ServiceState.SPEAKING
+                            if (bargeIn) {
+                                Log.i(TAG, "User speech detected during model response; barging in")
+                                beginActionTurn()
+                                ttsEngine.stop()
+                                audioStreamer?.interruptActiveTurn()
+                                transitionTo(ServiceState.LISTENING)
+                                overlayManager.show(OverlayManager.State.LISTENING)
+                                pushEvent(mapOf("state" to "LISTENING"))
+                            }
                             speechDetected = true
                             speechFramesCount = 1
                             silenceFrames = 0
-                            audioStreamer?.interruptPlayback()
                             Log.d(TAG, "Speech confirmed (RMS: $currentRms, NoiseFloor: $noiseFloorRms, VAD: $vadScore)")
-                            
-                            // Flush pre-roll buffer so the beginning of user speech is perfectly heard
                             while (preRollBuffer.isNotEmpty()) {
                                 audioStreamer?.sendAudioChunk(preRollBuffer.removeFirst())
                             }
-                            audioStreamer?.sendAudioChunk(bytes)
-                        } else if (SystemClock.elapsedRealtime() - startMs >= noSpeechTimeoutMs) {
+                        } else if (serviceState == ServiceState.LISTENING &&
+                            SystemClock.elapsedRealtime() - startMs >= noSpeechTimeoutMs
+                        ) {
                             Log.d(TAG, "Silence timeout (${noSpeechTimeoutMs}ms); resetting to idle")
                             resetToIdle()
                             pushEvent(mapOf("state" to "IDLE"))
@@ -1379,19 +1689,22 @@ class CoreVoiceService : Service(),
                             silenceFrames = 0
                         }
 
-                        // 4. Natural End-of-Speech trigger (avoids premature cutoffs)
+                        // End each user turn quickly, but keep the recorder open for barge-in.
                         if (speechFramesCount >= minSpeechFrames && silenceFrames >= maxSilenceFrames) {
                             Log.i(TAG, "Natural EOS detected ($silenceFrames frames quiet, $speechFramesCount spoken). Closing stream.")
                             audioStreamer?.sendEndOfSpeech()
                             transitionTo(ServiceState.PROCESSING)
                             overlayManager.show(OverlayManager.State.PROCESSING)
                             pushEvent(mapOf("state" to "PROCESSING"))
-                            break
+                            speechDetected = false
+                            silenceFrames = 0
+                            speechFramesCount = 0
+                            preRollBuffer.clear()
                         }
                     }
                 }
 
-                if (speechDetected && serviceState == ServiceState.PROCESSING) {
+                if (speechDetected && serviceState == ServiceState.LISTENING) {
                     scheduleBackendFallback()
                 }
 
@@ -1434,9 +1747,14 @@ class CoreVoiceService : Service(),
     }
 
     private fun pushEvent(data: Map<String, String>) {
-        val json = JSONObject(data).toString()
         mainHandler.post {
-            eventSink?.success(json)
+            if (serviceDestroyed) return@post
+            val payload = JSONObject(data).apply {
+                put("sessionId", sessionId)
+                put("sequenceId", eventSequence.incrementAndGet())
+                put("serviceState", serviceState.name)
+            }
+            eventSink?.success(payload.toString())
         }
     }
 

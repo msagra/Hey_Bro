@@ -3,7 +3,7 @@ package com.example.hey_bro
 import android.content.Context
 import android.util.Log
 
-class WakeWordManager(context: Context, picovoiceKey: String = "") {
+class WakeWordManager(context: Context) {
 
     private val TAG = "WakeWordManager"
 

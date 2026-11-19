@@ -36,6 +36,7 @@ class OverlayManager(private val context: Context) {
     private var hideRunnable: Runnable? = null
     private var cachedLayoutParams: WindowManager.LayoutParams? = null
     private var cachedBackground: GradientDrawable? = null
+    @Volatile private var updateSequence = 0L
 
     enum class State { LISTENING, PROCESSING, PLAYING }
 
@@ -45,17 +46,26 @@ class OverlayManager(private val context: Context) {
 
     fun show(state: State, label: String = "") {
         if (!canDrawOverlays()) return
-        mainHandler.post { _show(state, label) }
+        val sequence = synchronized(this) { ++updateSequence }
+        mainHandler.post {
+            if (sequence == updateSequence) _show(state, label)
+        }
     }
 
     fun hide() {
         hideRunnable?.let { mainHandler.removeCallbacks(it) }
-        mainHandler.post { _hide() }
+        val sequence = synchronized(this) { ++updateSequence }
+        mainHandler.post {
+            if (sequence == updateSequence) _hide()
+        }
     }
 
     fun hideDelayed(delayMs: Long = 1500) {
         hideRunnable?.let { mainHandler.removeCallbacks(it) }
-        hideRunnable = Runnable { _hide() }
+        val sequence = synchronized(this) { ++updateSequence }
+        hideRunnable = Runnable {
+            if (sequence == updateSequence) _hide()
+        }
         mainHandler.postDelayed(hideRunnable!!, delayMs)
     }
 

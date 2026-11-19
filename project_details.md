@@ -31,8 +31,8 @@ graph TD
     NoiseFloor -->|Offline / Fallback| LocalSTT[LocalSttEngine - On Device]
     
     %% Gemini Live Path
-    WS -->|Realtime Input 16kHz PCM| GemLive[Gemini 2.0 Flash Live API wss://generativelanguage.googleapis.com]
-    GemLive -->|Native 24kHz PCM Audio Stream| AudioTrack[Android AudioTrack Playback - Sub-200ms]
+    WS -->|Realtime Input 16kHz PCM| GemLive[Gemini Live API wss://generativelanguage.googleapis.com]
+    GemLive -->|Native 24kHz PCM Audio Stream| AudioTrack[Android AudioTrack Playback]
     GemLive -->|Tool Call JSON makeCall, openApp, etc.| ToolHandler[AudioStreamer Tool Call Dispatcher]
     ToolHandler -->|Execute Action| DeviceOp[DeviceOperatorService Accessibility Engine]
     ToolHandler -->|Return toolResponse| GemLive
@@ -41,7 +41,7 @@ graph TD
     LocalSTT -->|Partial Result Intercept| FastAction[Instant Local Execution]
     LocalSTT -->|Final Transcript| LCP[LocalCommandProcessor]
     LCP -->|Local Rule / Compound Match| DeviceOp
-    LCP -->|Conversational / Fallback| GeminiBridge[GeminiIntentBridge gemini-2.0-flash]
+    LCP -->|Conversational / Fallback| GeminiBridge[GeminiIntentBridge REST fallback]
     GeminiBridge -->|Voice Reply <20 words| TTSLocal
     GeminiBridge -->|JSON Action| DeviceOp
     
@@ -54,14 +54,14 @@ graph TD
 2. **Wake Activation & Greeting**: When "Hey Bro" is detected, `CoreVoiceService` initiates a quick spoken acknowledgement (*"Hi Sandip, what can I do for you?"*), shows the glowing overlay, and transitions to `ServiceState.LISTENING`.
 3. **Direct Gemini Live Ingestion**:
    - `AudioStreamer` establishes a bidirectional WebSocket connection to `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={GEMINI_API_KEY}`.
-   - Initial handshake declares system instructions, voice configuration (`Aoede`), and tool definitions for all 100+ phone actions.
+   - Initial handshake declares system instructions, voice configuration (`Aoede`), and tool definitions for supported device actions.
    - Streamed audio is sent as 16kHz PCM `realtimeInput` chunks.
-4. **Sub-200ms Neural Audio & Tool Calling**:
+4. **Streaming Neural Audio & Tool Calling**:
    - Gemini Live returns native 24kHz 16-bit PCM Linear Mono audio (`inlineData`) streamed directly to Android `AudioTrack`.
    - When Gemini invokes a tool (e.g. `makeCall`, `replyNotification`, `controlHardware`, `openApp`, `sendWhatsApp`, `readNotifications`), `AudioStreamer` unpacks parameters, executes the command via `DeviceOperatorService`, and sends a `toolResponse` back over WebSocket.
-   - Natural voice interruption / barge-in is supported: when the user speaks while the model is responding, `interrupted` flushes the `AudioTrack` immediately.
+   - Barge-in keeps the microphone active through generation, flushes `AudioTrack`, and starts a new `realtimeInput.activityStart`; model `interrupted` events also flush playback.
 5. **Offline / Fallback Resilience**:
-   - If internet is unavailable or socket disconnects, the system instantly delegates to `LocalSttEngine` + `LocalCommandProcessor` + `GeminiIntentBridge` for local execution without user interruption.
+   - If the live socket disconnects, local STT and deterministic rules continue to handle supported device commands. Gemini REST intent fallback is used only when network access is available; unsupported offline requests cannot be resolved by a cloud model.
 
 ---
 
@@ -84,7 +84,7 @@ hey_bro/
 │   │       ├── DeviceOperatorService.kt    # Accessibility automation engine (100+ actions)
 │   │       ├── HeyBroNotificationListenerService.kt # Notification reader & RemoteInput replier
 │   │       ├── LocalCommandProcessor.kt    # Offline fuzzy intent parser & compound unroller
-│   │       ├── GeminiIntentBridge.kt       # Direct on-device gemini-2.0-flash bridge
+│   │       ├── GeminiIntentBridge.kt       # Direct on-device Gemini REST bridge
 │   │       ├── LocalSttEngine.kt           # On-device SpeechRecognizer with error recovery
 │   │       ├── LocalTtsEngine.kt           # Android TextToSpeech wrapper
 │   │       ├── HeyBroPhraseWakeEngine.kt   # Continuous silent phrase detector
@@ -96,11 +96,7 @@ hey_bro/
 │   ├── build.gradle.kts                    # Root build configuration
 │   └── app/build.gradle.kts                # Android app dependencies (coroutines, ONNX, JSON)
 │
-├── backend/                                # [OPTIONAL / LEGACY] Self-Hosted FastAPI Server
-│   ├── main.py                             # Optional local server fallback
-│   ├── run.py                              # Local runner
-│   ├── requirements.txt                    # Python dependencies
-│   └── .env                                # Legacy credentials
+├── backend/                                # Not present; middleware is intentionally not used
 │
 └── project_details.md                      # Comprehensive architecture specification
 ```
@@ -120,8 +116,10 @@ hey_bro/
 - **Silero VAD Integration**: Evaluates neural network score `vadScore > 0.35f` to confirm human voice against background noise.
 
 ### 3.3 Fast End-of-Speech (EOS) & Natural Interruption
-- Captures trailing silence frames. When `speechDetected && silenceFrames >= 8` (~256ms), transitions to `ServiceState.PROCESSING`.
-- When user speaks while model audio is playing, `AudioTrack` is immediately flushed and paused (natural barge-in).
+- An 8-frame rolling buffer (~256ms) preserves audio before VAD onset and is flushed exactly once when speech starts.
+- Captures trailing silence frames. When `speechDetected && silenceFrames >= 12` (~384ms), sends `activityEnd` and transitions to `ServiceState.PROCESSING`.
+- Microphone capture continues while Gemini generates its response. Speech onset flushes 24kHz playback, starts a new input activity, and streams the buffered interruption audio.
+- `AcousticEchoCanceler` and `NoiseSuppressor` are enabled on capture where supported; local TTS has a short speech monitor for interruption.
 
 ---
 
@@ -145,9 +143,12 @@ The app declares the following required permissions in `android/app/src/main/And
 ### 4.2 Native Kotlin Components
 - **[`CoreVoiceService.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/CoreVoiceService.kt)**: Foreground service, audio focus management, state machine (`IDLE`, `LISTENING`, `PROCESSING`, `SPEAKING`), WebSocket live bridge, fallback watchdog.
 - **[`DeviceOperatorService.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/DeviceOperatorService.kt)**: Accessibility automation engine (100+ actions, `clickNode`, `setTextNode`, `makeCall` with SIM slots, `controlHardware`, `MULTI_ACTION` unrolling).
+- `ACTION` envelopes are checked for recognized action names, required fields, and bounded values. Sensitive communication, airplane-mode, and lock-screen operations require spoken confirmation.
+- `MULTI_ACTION` sequences are limited to 16 steps, allow bounded target-package preconditions and settle waits, and emit per-step progress/error events over the existing EventChannel.
+- Screen-aware requests can attach a compact hierarchy of clickable/editable nodes and a bounded recent-notification summary to Gemini Live; editable contents are not serialized.
 - **[`HeyBroNotificationListenerService.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/HeyBroNotificationListenerService.kt)**: Synchronized notification caching (`ConcurrentHashMap`), direct background replies via `RemoteInput.addResultsToIntent`, and spoken message summaries.
 - **[`LocalCommandProcessor.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/LocalCommandProcessor.kt)**: Phonetic normalization, homophone correction, compound command parsing (`checkCompoundCommands`), offline rule matches, regex extractors.
-- **[`GeminiIntentBridge.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/GeminiIntentBridge.kt)**: On-device `gemini-2.0-flash` bridge, JSON schema mode, conversational Alexa/Echo Q&A generator (<20 words).
+- **[`GeminiIntentBridge.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/GeminiIntentBridge.kt)**: Direct Gemini REST fallback bridge with JSON action handling.
 - **[`LocalSttEngine.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/LocalSttEngine.kt)**: On-device `SpeechRecognizer`, Error 11 recovery, fast timeouts (`600L`/`500L`/`400L`), smart partial result interception.
 - **[`HeyBroPhraseWakeEngine.kt`](file:///d:/hey_bro/android/app/src/main/kotlin/com/example/hey_bro/HeyBroPhraseWakeEngine.kt)**: Continuous offline wake recognition, start-beep / chime suppression (`AudioManager.STREAM_SYSTEM` mute and `RecognizerIntent` feedback suppression).
 
@@ -164,7 +165,7 @@ The client communicates directly with Google's Gemini Multimodal Live API over s
   ```json
   {
     "setup": {
-      "model": "models/gemini-2.0-flash-exp",
+      "model": "models/gemini-3.8-live",
       "generationConfig": {
         "responseModalities": ["AUDIO"],
         "speechConfig": {
@@ -242,29 +243,30 @@ The client communicates directly with Google's Gemini Multimodal Live API over s
 
 ### 5.4 Live Interruption (Barge-In) Protocol
 - When Gemini is streaming speech audio and the phone's dynamic VAD detects user speech:
-  - `AudioStreamer` immediately flushes and pauses `AudioTrack`.
+  - `AudioStreamer` immediately flushes and pauses `AudioTrack` and starts a new input activity.
   - In-flight audio buffers are dropped.
-  - New `realtimeInput` microphone chunks stream to Gemini, allowing fluid conversational interruption.
+  - New `realtimeInput` microphone chunks, including a short onset buffer, stream to Gemini.
 
 ---
 
 ## 6. Flutter UI & Bridge Contracts
 
 ### 6.1 Platform Channels
-- **MethodChannel** (`com.example.hey_bro/commands`):
-  - `startListening()`: Manually trigger voice capture (push-to-talk).
-  - `stopListening()`: Cancel active listening session.
-  - `updateSettings(Map)`: Updates backend URL or Gemini API keys.
+- **MethodChannel** (`com.example.hey_bro/assistant`):
+  - `startAssistantService` / `stopAssistantService`: Controls the native service.
+  - `triggerAssistant`: Manually starts voice capture (push-to-talk).
+  - `setBackendWs` / `setGeminiApiKey`: Updates WebSocket URL or Gemini API key.
   - `checkPermissions()`: Verifies microphone, phone, accessibility, and overlay permissions.
 - **EventChannel** (`com.example.hey_bro/events`):
   - Streams state updates to Flutter:
     ```json
-    { "state": "LISTENING" }
+    { "state": "LISTENING", "sessionId": "...", "sequenceId": 1, "serviceState": "LISTENING" }
     { "state": "PROCESSING", "transcript": "Turn on flashlight" }
-    { "state": "PLAYING", "response": "Turning on flashlight" }
+    { "state": "PLAYING", "response": "Turning on flashlight", "sessionId": "...", "sequenceId": 2, "serviceState": "SPEAKING" }
     { "state": "IDLE" }
     { "state": "CONNECTED", "wsConnected": "true" }
     ```
+  - Native events include a per-service `sessionId`, monotonic `sequenceId`, and canonical `serviceState`. Flutter drops stale sequence updates and requests a snapshot whenever it subscribes.
 
 ### 6.2 Flutter UI Components ([lib/main.dart](file:///d:/hey_bro/lib/main.dart))
 - **Dashboard Screen**: Central interactive hub.

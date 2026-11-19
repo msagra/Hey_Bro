@@ -9,6 +9,7 @@ object VoiceLearningStore {
     private const val PREF_NAME = "hey_bro_learning"
     private const val ALIAS_KEY = "custom_aliases"
     private var prefs: android.content.SharedPreferences? = null
+    @Volatile private var cachedAliases: Map<String, String>? = null
     private val supportedActions = setOf(
         "openApp", "openCamera", "takePhoto", "takeSelfie", "setAlarm", "setTimer",
         "makeCall", "sendWhatsApp", "searchWeb", "openMaps", "playMedia", "screenshot",
@@ -21,8 +22,10 @@ object VoiceLearningStore {
         "sleep"
     )
 
+    @Synchronized
     fun initialize(context: Context) {
         prefs = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
+        cachedAliases = null
         seedDefaultsIfEmpty()
     }
 
@@ -60,20 +63,22 @@ object VoiceLearningStore {
             "open whatsapp" to "openApp:com.whatsapp",
             "open youtube" to "openApp:com.google.android.youtube"
         )
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(defaults).toString())?.apply()
+        saveMap(defaults)
         Log.i(TAG, "Seeded ${defaults.size} default voice shortcuts into VoiceLearningStore")
     }
 
+    @Synchronized
     fun learn(transcript: String, action: String) {
         val normalized = normalize(transcript)
         val baseAction = if (action.startsWith("openApp:")) "openApp" else action.split(":").first()
         if (normalized.isBlank() || (baseAction !in supportedActions && !action.contains(":"))) return
         val current = loadMap().toMutableMap()
         current[normalized] = action
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
-        Log.d(TAG, "Learned alias: '$normalized' -> '$action'")
+        saveMap(current)
+        Log.d(TAG, "Learned a voice shortcut")
     }
 
+    @Synchronized
     fun learnBatch(entries: Map<String, String>) {
         if (entries.isEmpty()) return
         val current = loadMap().toMutableMap()
@@ -84,19 +89,21 @@ object VoiceLearningStore {
                 current[normalized] = action
             }
         }
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
-        Log.d(TAG, "Learned batch of ${entries.size} aliases")
+        saveMap(current)
+        Log.d(TAG, "Learned ${entries.size} voice shortcuts")
     }
 
+    @Synchronized
     fun remove(transcript: String) {
         val normalized = normalize(transcript)
         val current = loadMap().toMutableMap()
         if (current.remove(normalized) != null) {
-            prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
-            Log.d(TAG, "Removed alias: '$normalized'")
+            saveMap(current)
+            Log.d(TAG, "Removed a voice shortcut")
         }
     }
 
+    @Synchronized
     fun replaceAll(entries: Map<String, String>) {
         val current = linkedMapOf<String, String>()
         for ((phrase, action) in entries) {
@@ -106,21 +113,28 @@ object VoiceLearningStore {
                 current[normalized] = action
             }
         }
-        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(current as Map<*, *>).toString())?.apply()
+        saveMap(current)
         Log.d(TAG, "Replaced all learned aliases (${current.size} entries)")
     }
 
+    @Synchronized
     fun findActionForTranscript(transcript: String): String? {
         val normalized = normalize(transcript)
         if (normalized.isBlank()) return null
         val mapping = loadMap()
         for ((alias, action) in mapping) {
-            if (normalized == alias || normalized.contains(alias) || alias.contains(normalized) ||
-                tokenSimilarity(normalized, alias) >= 0.82f) {
+            val phraseMatch = Regex("(?:^|\\s)${Regex.escape(alias)}(?:$|\\s)").containsMatchIn(normalized)
+            if (normalized == alias || phraseMatch ||
+                (normalized.length >= 8 && tokenSimilarity(normalized, alias) >= 0.82f)) {
                 return action
             }
         }
         return null
+    }
+
+    @Synchronized
+    fun findExactActionForTranscript(transcript: String): String? {
+        return loadMap()[normalize(transcript)]
     }
 
     private fun tokenSimilarity(left: String, right: String): Float {
@@ -131,8 +145,9 @@ object VoiceLearningStore {
     }
 
     private fun loadMap(): Map<String, String> {
+        cachedAliases?.let { return it }
         val raw = prefs?.getString(ALIAS_KEY, "") ?: ""
-        if (raw.isBlank()) return emptyMap()
+        if (raw.isBlank()) return emptyMap<String, String>().also { cachedAliases = it }
         return try {
             val json = JSONObject(raw)
             val result = linkedMapOf<String, String>()
@@ -142,11 +157,18 @@ object VoiceLearningStore {
                 val value = json.optString(key, "")
                 if (value.isNotBlank()) result[key] = value
             }
-            result
+            result.toMap().also { cachedAliases = it }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to parse learned aliases", e)
             emptyMap()
         }
+    }
+
+    @Synchronized
+    private fun saveMap(entries: Map<String, String>) {
+        val snapshot = entries.toMap()
+        prefs?.edit()?.putString(ALIAS_KEY, JSONObject(snapshot).toString())?.apply()
+        cachedAliases = snapshot
     }
 
     private fun normalize(value: String): String = value
